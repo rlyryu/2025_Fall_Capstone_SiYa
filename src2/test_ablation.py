@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 from PIL import Image
 
 from dataset.loader import CustomSample, create_wsi_dataloader, load_global_gene_order
-from models.model import MultiModalMILModel
+from models.model_ablation import MultiModalMILModel
 
 """
 - wsi에서 중요도 높은 패치 보여주기(img)
@@ -18,7 +18,7 @@ from models.model import MultiModalMILModel
 
 # Detect samples -> return
 def discover_samples(root_dir):
-    st_dir = os.path.join(root_dir, "st_preprocessed_global_hvg")  # <- 본인 폴더 구조에 맞게 유지
+    st_dir = os.path.join(root_dir, "st_preprocessed_global_hvg")
     patch_dir = os.path.join(root_dir, "patches")
 
     assert os.path.isdir(st_dir), f"ST dir not found: {st_dir}"
@@ -57,6 +57,34 @@ def compute_2d_embedding(X: np.ndarray, method: str = "umap", seed: int = 0):
 
     raise ValueError(f"Unknown method: {method}")
 
+# top percent attn extraction util
+def make_top_percent_mask(attn: torch.Tensor, top_percent: float = 0.6, min_points: int = 10):
+    """
+    attn: (N,) torch.Tensor
+    top_percent: keep top 70% => 0.7
+    min_points: safety fallback (avoid empty / too few)
+    returns: mask (N,) bool torch.Tensor
+    """
+    attn = attn.view(-1)
+    N = attn.numel()
+    if N == 0:
+        return torch.zeros_like(attn, dtype=torch.bool)
+
+    # 상위 n%를 남기려면 threshold는 하위 (100-n)% 지점(=quantile (1-n/100))
+    q = 1.0 - float(top_percent)
+    q = min(max(q, 0.0), 1.0)
+
+    thr = torch.quantile(attn, q)
+    mask = attn >= thr
+
+    # fallback: 너무 적게 선택되면 top-k로 보장
+    if mask.sum().item() < min_points:
+        k = min(min_points, N)
+        idx = torch.topk(attn, k=k).indices
+        mask = torch.zeros(N, dtype=torch.bool, device=attn.device)
+        mask[idx] = True
+
+    return mask
 
 # IO utils
 def save_patch_image(tensor_chw, out_path):
@@ -69,14 +97,33 @@ def save_patch_image(tensor_chw, out_path):
 
 
 # attention score 높은 patch plot
-def plot_attention_scatter(coords_raw, attn, top10_idx, out_path, title="Patch importance (MIL attn)"):
+def plot_attention_scatter(coords_raw, attn, top10_idx, out_path,
+                           title="Spot importance (MIL attn)",
+                           mask=None):
     """
-    coords_raw: (N,2) torch.Tensor  (original spatial coords)
+    coords_raw: (N,2) torch.Tensor
     attn: (N,) torch.Tensor
-    top10_idx: list[int]
+    mask: (N,) bool torch.Tensor (True만 plot)
     """
-    c = coords_raw.detach().cpu().numpy()
-    a = attn.detach().cpu().numpy()
+    c_all = coords_raw.detach().cpu().numpy()
+    a_all = attn.detach().cpu().numpy()
+
+    if mask is not None:
+        m = mask.detach().cpu().numpy().astype(bool)
+    else:
+        m = np.ones(len(a_all), dtype=bool)
+
+    c = c_all[m]
+    a = a_all[m]
+
+    if len(a) == 0:
+        # 안전장치: 백지 저장 (원하면 return만 해도 됨)
+        plt.figure()
+        plt.title(title + " (empty after masking)")
+        plt.tight_layout()
+        plt.savefig(out_path, dpi=200)
+        plt.close()
+        return
 
     a_min, a_max = float(a.min()), float(a.max())
     denom = (a_max - a_min) if (a_max - a_min) > 1e-12 else 1.0
@@ -84,22 +131,25 @@ def plot_attention_scatter(coords_raw, attn, top10_idx, out_path, title="Patch i
     sizes = 10 + 200 * a_n
 
     plt.figure()
-    plt.scatter(c[:, 0], c[:, 1], s=sizes)  # 색 지정 안 함
+    plt.scatter(c[:, 0], c[:, 1], s=sizes)  # 백지 위 scatter
 
+    # Top10도 mask에 포함된 점만
     if top10_idx is not None and len(top10_idx) > 0:
         sel = np.array(top10_idx, dtype=np.int64)
-        plt.scatter(c[sel, 0], c[sel, 1], s=250, marker="x")
-        for rank, i in enumerate(sel.tolist(), start=1):
-            plt.text(c[i, 0], c[i, 1], f"Top{rank}", fontsize=10)
+        sel = sel[sel < len(m)]          # boundary safety
+        sel = sel[m[sel]]                # mask 통과한 top10만 남김
+        if len(sel) > 0:
+            plt.scatter(c_all[sel, 0], c_all[sel, 1], s=250, marker="x")
+            for rank, i in enumerate(sel.tolist(), start=1):
+                plt.text(c_all[i, 0], c_all[i, 1], f"Top{rank}", fontsize=10)
 
     plt.title(title)
     plt.xlabel("x")
     plt.ylabel("y")
-    plt.gca().invert_yaxis()  # 필요 없으면 제거
+    plt.gca().invert_yaxis()
     plt.tight_layout()
     plt.savefig(out_path, dpi=200)
     plt.close()
-
 
 # 중요도 높은 gene 집계
 def aggregate_top_genes(gene_attn, gene_indices, mil_attn, gene_order, topk=30):
@@ -154,11 +204,11 @@ def main():
     parser.add_argument("--topk_genes", type=int, default=30)
     parser.add_argument("--embed_2d", type=str, default="umap", choices=["umap", "pca"])
 
-    # 예시 args (로컬 디버깅용, 수정할 것)
+    # 예시 args (로컬 디버깅용, 수정할 것!!!)
     args = parser.parse_args(args=[
         "--root_dir", r"C:\Users\rdh08\Desktop\Capstone\src2\hest_data",
-        "--ckpt", r"C:\Users\rdh08\Desktop\Capstone\src2\best_model_concat.pt",
-        "--use_image",
+        "--ckpt", r"C:\Users\rdh08\Desktop\Capstone\src2\best_model_st_concat.pt",
+        # "--use_image",
         "--use_st",
     ])
 
@@ -169,6 +219,19 @@ def main():
 
     assert args.use_image or args.use_st, "At least one modality must be enabled"
 
+    if args.use_image and args.use_st:
+        print("Running in MULTIMODAL mode (image + ST)")
+        mode_suffix = "st_img"
+    elif args.use_image and not args.use_st:
+        print("Running in IMAGE-ONLY mode")
+        mode_suffix = "img"
+    elif not args.use_image and args.use_st:
+        print("Running in ST-ONLY mode")
+        mode_suffix = "st"
+    else:
+        raise ValueError("Invalid modality setting")
+    
+    args.out_dir = f"{args.out_dir}_{mode_suffix}"
     os.makedirs(args.out_dir, exist_ok=True)
 
     # samples + loader
@@ -224,6 +287,8 @@ def main():
 
             label = int(batch["label"].item())
 
+            print(f"Processing: {sample_id}")
+            
             # modality별로 필요한 것만 GPU로
             images = batch["images"].to(args.device) if args.use_image else None
             expr   = batch["expr"].to(args.device)   if args.use_st else None
@@ -347,12 +412,15 @@ def main():
 
             # attention scatter (coords_raw 기반) — coords_raw는 st에서 오는 경우가 많지만, loader가 주면 그냥 사용
             if coords_raw is not None:
+                mask70 = make_top_percent_mask(mil_attn, top_percent=0.7, min_points=20)
+
                 plot_attention_scatter(
                     coords_raw=coords_raw,
                     attn=mil_attn.detach().cpu(),
                     top10_idx=top10,
                     out_path=os.path.join(out_dir, "patch_attn_scatter_top10.png"),
-                    title="Spot importance (MIL attn) + Top10"
+                    title="Spot importance (MIL attn) Top10",
+                    mask=mask70
                 )
 
             # (D) gene top list: ST 켜져 있고 gene_attn/gene_indices 있을 때만
