@@ -459,11 +459,7 @@ class MultiModalMILModel(nn.Module):
             "gene_indices": gene_indices,
         }
 
-        # train_bulk.py는 return_spot_embeds=False로 호출 중이라 사실 필요 없지만,
-        # 호환/확장 위해 옵션은 남겨둠.
         if return_spot_embeds:
-            # slide-level fusion에서는 "융합 spot embedding"이 명확히 정의되지 않으므로
-            # 보통 img_feat_all(=이미지 spot embedding)만 리턴하거나 None 처리.
             out["spot_embeds"] = img_feat_all
 
         return out

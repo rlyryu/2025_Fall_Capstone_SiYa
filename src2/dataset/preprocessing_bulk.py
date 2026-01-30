@@ -27,7 +27,7 @@ import shutil
 # ============================================
 # Configuration
 # ============================================
-HF_TOKEN = "YOUR TOKEN"
+HF_TOKEN = "YOUR_TOKEN"
 DOWNLOAD_ALL = False
 FOLDERS = ['metadata', 'st', 'patches']  # Added patches folder
 LOCAL_DIR = 'hest_data'

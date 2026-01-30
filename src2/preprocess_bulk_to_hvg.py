@@ -43,7 +43,7 @@ def convert_one(in_path: str, out_path: str, hvg_list):
         out[t] = x_full[j]
 
     # 3) (1,2000) 형태로 h5ad 저장
-    obs = adata.obs.copy()
+    obs=adata.obs.copy()
     
     out_adata = sc.AnnData(
         X=out.reshape(1, -1),
