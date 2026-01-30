@@ -1,0 +1,15 @@
+{
+  "sample_id": "NCBI729",
+  "gt_label": 0,
+  "pred_label": 0,
+  "probs": [
+    0.5507784485816956,
+    0.44922158122062683
+  ],
+  "num_spots_used": 2000,
+  "use_image": true,
+  "use_st": true,
+  "mil_attn_available": true,
+  "spot_embeds_available": true,
+  "gene_xai_available": true
+}

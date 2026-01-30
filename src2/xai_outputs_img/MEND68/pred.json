@@ -1,0 +1,15 @@
+{
+  "sample_id": "MEND68",
+  "gt_label": 1,
+  "pred_label": 1,
+  "probs": [
+    0.24896448850631714,
+    0.7510355114936829
+  ],
+  "num_spots_used": 1486,
+  "use_image": true,
+  "use_st": false,
+  "mil_attn_available": true,
+  "spot_embeds_available": true,
+  "gene_xai_available": false
+}
