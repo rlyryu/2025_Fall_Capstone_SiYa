@@ -1,366 +1,488 @@
-import os
-import json
-import argparse
-import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-import matplotlib.pyplot as plt
-from PIL import Image
-
-from dataset.loader import CustomSample, create_wsi_dataloader, load_global_gene_order
-from models.model import MultiModalMILModel
+import torchvision.models as models
+from models.performer_pytorch import Performer
 
 """
-- wsi에서 중요도 높은 패치 보여주기(img)
-- 중요도 높은 gene들 뽑아주기(expr)
-- 중요도 높은 스팟 보여주기 (st)
+An ablation-support ver. of model.py:
+- ST-only
+- Image-only
+- Multimodal(ST+Image)
 """
 
-# Detect samples -> return 
-def discover_samples(root_dir):
-    st_dir = os.path.join(root_dir, "st_preprocessed_global_hvg")
-    patch_dir = os.path.join(root_dir, "patches")
+# =======================================================
+# 1. Image Encoder (Patch → Spot-level visual feature)
+# =======================================================
+class ImageEncoder(nn.Module):
+    def __init__(self, embed_dim=256):
+        super().__init__()
+        self.backbone = models.resnet18(weights="IMAGENET1K_V1")
+        self.backbone.fc = nn.Linear(self.backbone.fc.in_features, embed_dim)
 
-    assert os.path.isdir(st_dir), f"ST dir not found: {st_dir}"
-    assert os.path.isdir(patch_dir), f"Patch dir not found: {patch_dir}"
+    def forward(self, x):
+        """
+        x: (N_spots, 3, 224, 224)
+        return: (N_spots, embed_dim)
+        """
+        return self.backbone(x)
 
-    sample_ids = []
-    for fn in os.listdir(st_dir):
-        if fn.endswith(".h5ad"):
-            sid = fn[:-5]
-            if os.path.exists(os.path.join(patch_dir, f"{sid}.h5")):
-                sample_ids.append(sid)
-    sample_ids.sort()
-
-    samples = [CustomSample(root_dir, sid) for sid in sample_ids]
-    return samples
-
-# UMAP/PCA util
-def compute_2d_embedding(X: np.ndarray, method: str = "umap", seed: int = 0):
+# =======================================================
+# 2. Spatial ST Encoder (HVG-only, scBERT-style)
+# =======================================================
+class SpatialSTEncoder(nn.Module):
     """
-    X: (N, D)
-    returns: (N, 2)
+    scBERT-style encoder with explicit spatial token
+
+    Input:
+      - expr   : (N_spots, K)   [already HVG-filtered]
+      - coords : (N_spots, 2)   [normalized]
+
+    Output:
+      - (N_spots, embed_dim) spot-level ST embedding
     """
-    if method == "umap":
-        try:
-            import umap
-            reducer = umap.UMAP(n_components=2, random_state=seed)
-            return reducer.fit_transform(X)
-        except Exception as e:
-            print(f"[warn] UMAP not available ({e}). Falling back to PCA.")
-            method = "pca"
 
-    if method == "pca":
-        from sklearn.decomposition import PCA
-        return PCA(n_components=2, random_state=seed).fit_transform(X)
+    def __init__(
+        self,
+        num_genes,        # K = number of HVGs (e.g., 2000)
+        embed_dim=256,
+        num_layers=2,
+        num_heads=4,
+        top_k_genes=None,
+    ):
+        super().__init__()
 
-    raise ValueError(f"Unknown method: {method}")
+        self.embed_dim = embed_dim
+        self.num_genes = num_genes
+        self.top_k_genes = top_k_genes
 
-# IO utils
-def save_patch_image(tensor_chw, out_path):
+        # Gene identity embedding (HVG-only)
+        self.gene_embedding = nn.Embedding(num_genes, embed_dim)
+
+        # Gene positional embedding (gene order)
+        self.gene_pos_embedding = nn.Embedding(num_genes, embed_dim)
+
+        # Expression value embedding
+        self.value_embedding = nn.Sequential(
+            nn.Linear(1, embed_dim),
+            nn.LayerNorm(embed_dim),
+            nn.GELU()
+        )
+
+        # Spatial token embedding
+        self.spatial_embedding = nn.Sequential(
+            nn.Linear(2, embed_dim),
+            nn.LayerNorm(embed_dim),
+            nn.GELU()
+        )
+
+        # Performer (efficient transformer)
+        self.transformer = Performer(
+            dim=embed_dim,
+            depth=num_layers,
+            heads=num_heads,
+            dim_head=embed_dim // num_heads,
+            causal=False,
+            ff_mult=4,
+            attn_dropout=0.1,
+            ff_dropout=0.1,
+        )
+
+        # Spatial-query pooling
+        self.q_proj = nn.Linear(embed_dim, embed_dim)
+        self.k_proj = nn.Linear(embed_dim, embed_dim)
+        self.v_proj = nn.Linear(embed_dim, embed_dim)
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
+
+    def forward(self, expr, coords, return_gene_attn=False):
+        """
+        expr   : (N, K)
+        coords : (N, 2)
+
+        if return_gene_attn:
+          returns:
+            pooled: (N, D)
+            gene_attn: (N, G_used)          # G_used = top_k_genes or K
+            gene_indices: (N, G_used) (long) # global gene ids
+        else:
+          returns:
+            pooled: (N, D)
+        """
+        N, K = expr.shape
+        device = expr.device
+
+        # Top-K gene selection
+        if self.top_k_genes and self.top_k_genes < K:
+            topk_values, topk_indices = torch.topk(expr, k=self.top_k_genes, dim=1)
+            gene_indices = topk_indices.long()  # global gene ids
+
+            gene_embed = self.gene_embedding(gene_indices)  # (N, top_k, D)
+            gene_pos = self.gene_pos_embedding(gene_indices)
+            value_emb = self.value_embedding(topk_values.unsqueeze(-1))
+            gene_tokens = gene_embed + gene_pos + value_emb
+        else:
+            gene_ids = torch.arange(K, device=device).unsqueeze(0).expand(N, -1).long()
+            gene_embed = self.gene_embedding(gene_ids)
+            gene_pos = self.gene_pos_embedding(gene_ids)
+            value_emb = self.value_embedding(expr.unsqueeze(-1))
+            gene_tokens = gene_embed + gene_pos + value_emb
+
+        spatial_token = self.spatial_embedding(coords).unsqueeze(1)
+        tokens = torch.cat([spatial_token, gene_tokens], dim=1)
+
+        tokens = self.transformer(tokens)
+
+        spatial_out = tokens[:, :1]
+        gene_out    = tokens[:, 1:]
+
+        q = self.q_proj(spatial_out)
+        k = self.k_proj(gene_out)
+        v = self.v_proj(gene_out)
+
+        attn = torch.softmax(
+            torch.matmul(q, k.transpose(-2, -1)) / (self.embed_dim ** 0.5),
+            dim=-1
+        )
+
+        pooled = torch.matmul(attn, v).squeeze(1)
+        pooled = self.out_proj(pooled)
+
+        if return_gene_attn:
+            gene_attn = attn.squeeze(1)
+            return pooled, gene_attn, gene_indices
+        else:
+            return pooled
+
+# =======================================================
+# 3. Spot Fusion Module (4 options: concat, attn, sim, gate)
+# =======================================================
+class SpotFusionModule(nn.Module):
     """
-    tensor_chw: torch.Tensor (3,H,W), range ~[0,1]
+    Fusion options:
+    - 'concat': Simple concatenation + MLP
+    - 'attn': Cross-attention between img and st
+    - 'sim': Similarity-based fusion (cosine, product, diff)
+    - 'gate': Gated fusion with learnable weights
     """
-    x = tensor_chw.detach().cpu().clamp(0, 1)
-    x = (x.permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
-    Image.fromarray(x).save(out_path)
+    def __init__(
+        self,
+        embed_dim=256,
+        fusion_option='concat',
+        attn_heads=4,
+        dropout=0.2,
+        use_l2norm_for_sim=True
+    ):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.fusion_option = fusion_option
+        self.dropout = dropout
+        self.use_l2norm_for_sim = use_l2norm_for_sim
+        
+        # Pre-normalization
+        self.pre_norm_img = nn.LayerNorm(embed_dim)
+        self.pre_norm_st = nn.LayerNorm(embed_dim)
 
-# attention score 높은 patch plot
-def plot_attention_scatter(coords_raw, attn, top10_idx, out_path, title="Patch importance (MIL attn)"):
-    """
-    coords_raw: (N,2) torch.Tensor  (original spatial coords)
-    attn: (N,) torch.Tensor
-    top10_idx: list[int]
-    """
-    c = coords_raw.detach().cpu().numpy()
-    a = attn.detach().cpu().numpy()
-
-    a_min, a_max = float(a.min()), float(a.max())
-    denom = (a_max - a_min) if (a_max - a_min) > 1e-12 else 1.0
-    a_n = (a - a_min) / denom
-    sizes = 10 + 200 * a_n
-
-    plt.figure()
-    plt.scatter(c[:, 0], c[:, 1], s=sizes)  # 색 지정 안 함
-
-    if top10_idx is not None and len(top10_idx) > 0:
-        sel = np.array(top10_idx, dtype=np.int64)
-        plt.scatter(c[sel, 0], c[sel, 1], s=250, marker="x")
-        for rank, i in enumerate(sel.tolist(), start=1):
-            plt.text(c[i, 0], c[i, 1], f"Top{rank}", fontsize=10)
-
-    plt.title(title)
-    plt.xlabel("x")
-    plt.ylabel("y")
-    plt.gca().invert_yaxis()  # 필요 없으면 제거
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=200)
-    plt.close()
-
-# 중요도 높은 gene 집계
-def aggregate_top_genes(gene_attn, gene_indices, mil_attn, gene_order, topk=30):
-    """
-    gene_attn: (N, G) torch.Tensor (per-spot attention over gene tokens)
-    gene_indices: (N, G) torch.LongTensor
-    mil_attn: (N,) torch.Tensor  (spot importance)
-    gene_order: list[str] length K_global
-    """
-    N, G = gene_attn.shape
-    mil_w = mil_attn.view(N, 1)
-
-    contrib = (gene_attn * mil_w).detach().cpu().numpy()  # (N,G)
-    gidx = gene_indices.detach().cpu().numpy().astype(np.int64)
-
-    scores = {}  # gene_id -> sum score
-    for i in range(N):
-        for j in range(G):
-            gid = int(gidx[i, j])
-            scores[gid] = scores.get(gid, 0.0) + float(contrib[i, j])
-
-    items = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:topk]
-    out = []
-    for gid, sc in items:
-        gname = gene_order[gid] if (0 <= gid < len(gene_order)) else f"gene_{gid}"
-        out.append((gname, sc))
-    return out
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--root_dir", type=str, required=True)
-    parser.add_argument("--ckpt", type=str, required=True)
-    parser.add_argument("--out_dir", type=str, default="./xai_outputs")
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-
-    # model params (일단 train과 통일)
-    parser.add_argument("--num_genes", type=int, default=2000)
-    parser.add_argument("--num_classes", type=int, default=2)
-    parser.add_argument("--embed_dim", type=int, default=256)
-    parser.add_argument("--fusion_option", type=str, default="concat")  # <- ver2_concat이 best여서 concat으로 진행
-    parser.add_argument("--top_k_genes", type=int, default=512)
-    parser.add_argument("--freeze_image_encoder", action="store_true")
-
-    # data params
-    parser.add_argument("--max_spots", type=int, default=2000)
-    parser.add_argument("--topk_patches", type=int, default=12)
-    parser.add_argument("--topk_genes", type=int, default=30)
-
-    args = parser.parse_args(args=[
-    "--root_dir", r"C:\Users\rdh08\Desktop\Capstone\src2\hest_data",
-    "--ckpt", r"C:\Users\rdh08\Desktop\Capstone\src2\best_model_concat.pt",
-])
-
-    os.makedirs(args.out_dir, exist_ok=True)
-
-    # samples + loader
-    samples = discover_samples(args.root_dir)
-    if len(samples) == 0:
-        raise RuntimeError("No samples discovered. Check root_dir structure.")
-    loader = create_wsi_dataloader(
-        samples,
-        batch_size=1,
-        shuffle=False,
-        max_spots=args.max_spots,
-        root_dir=args.root_dir,
-        return_trace=True,  # loader 수정본 기준
-    )
-
-    # gene order (fallback)
-    global_gene_order = load_global_gene_order(args.root_dir)
-    if global_gene_order is None:
-        global_gene_order = []
-
-    # model
-    model = MultiModalMILModel(
-        num_genes=args.num_genes,
-        num_classes=args.num_classes,
-        embed_dim=args.embed_dim,
-        fusion_option=args.fusion_option,
-        top_k_genes=args.top_k_genes,
-        freeze_image_encoder=args.freeze_image_encoder,
-
-    ).to(args.device)
-
-    ckpt = torch.load(args.ckpt, map_location="cpu")
-    if isinstance(ckpt, dict) and "state_dict" in ckpt:
-        state = ckpt["state_dict"]
-    elif isinstance(ckpt, dict) and "model_state_dict" in ckpt:
-        state = ckpt["model_state_dict"]
-    else:
-        state = ckpt
-
-    missing, unexpected = model.load_state_dict(state, strict=False)
-    print(f"[load] missing keys: {len(missing)}, unexpected keys: {len(unexpected)}")
-
-    model.eval()
-
-    with torch.inference_mode():
-        for batch in loader:
-            sample_id = batch["sample_id"]
-            out_dir = os.path.join(args.out_dir, sample_id)
-            os.makedirs(out_dir, exist_ok=True)
-
-            images = batch["images"].to(args.device)     # (N,3,H,W)
-            expr = batch["expr"].to(args.device)         # (N,K)
-            coords = batch["coords"].to(args.device)     # (N,2) normalized (model input)
-            label = int(batch["label"].item())
-
-            # XAI metadata (loader 수정본 기준 key들)
-            barcodes = batch.get("barcodes", None)            # list[str]
-            patch_indices = batch.get("patch_indices", None)  # np.ndarray
-            coords_raw = batch.get("coords_raw", None)        # torch.Tensor (N,2)
-            gene_order = batch.get("gene_order", global_gene_order)
-
-            # forward
-            outputs = model(
-                images, 
-                expr, 
-                coords, 
-                return_gene_attn=True, 
-                return_spot_embeds=True
+        if fusion_option == 'concat':
+            self.fuse = nn.Sequential(
+                nn.Linear(embed_dim * 2, embed_dim),
+                nn.LayerNorm(embed_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
             )
 
-            spot_embeds = outputs["spot_embeds"]  # (N, D)
-            mil_attn = outputs["mil_attn"]      # (N, )
-
-            # UMAP 코드
-            X = spot_embeds.detach().cpu().numpy()
-            Z = compute_2d_embedding(X, method="umap", seed=0)  # umap or pca
-
-            a = mil_attn.detach().cpu().numpy()
-            a_min, a_max = float(a.min()), float(a.max())
-            denom = (a_max - a_min) if (a_max - a_min) > 1e-12 else 1.0
-            a_n = (a - a_min) / denom
-            sizes = 10 + 200 * a_n
-
-            # 단색 ver(size only)
-            plt.figure()
-            plt.scatter(Z[:, 0], Z[:, 1], s=sizes)  # 색 지정 안 함
-            plt.title("UMAP of fused spot embeddings(size=mil_attn)")
-            plt.xlabel("UMAP-1")
-            plt.ylabel("UMAP-2")
-            plt.tight_layout()
-            plt.savefig(os.path.join(out_dir, "spot_embeds_umap.png"), dpi=200)
-            plt.close()
-
-            # 색 + 크기 모두
-            plt.figure()
-            plt.scatter(
-                Z[:, 0], Z[:, 1],
-                c=a_n,
-                s=10+200*a_n, 
-                cmap="viridis"
+        elif fusion_option == 'attn':
+            self.attn = nn.MultiheadAttention(
+                embed_dim=embed_dim,
+                num_heads=attn_heads,
+                dropout=dropout,
+                batch_first=True,
             )
-            plt.colorbar(label="MIL attention")
-            plt.title("UMAP of fused spot embeddings(color+size=mil_attn)")
-            plt.xlabel("UMAP-1")
-            plt.ylabel("UMAP-2")
-            plt.tight_layout()
-            plt.savefig(os.path.join(out_dir, "spot_embeds_umap_color.png"), dpi=200)
-            plt.close()
+            self.norm1 = nn.LayerNorm(embed_dim)
+            self.ffn = nn.Sequential(
+                nn.Linear(embed_dim, embed_dim * 4),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(embed_dim * 4, embed_dim),
+                nn.Dropout(dropout),
+            )
+            self.norm2 = nn.LayerNorm(embed_dim)
+            self.out_proj = nn.Linear(embed_dim, embed_dim)
 
-            if isinstance(outputs, dict):
-                logits = outputs.get("logits", outputs.get("out", None))
-                if logits is None:
-                    raise ValueError("Model dict output must contain 'logits' (or 'out').")
-                mil_attn = outputs.get("mil_attn", None)
-                gene_attn = outputs.get("gene_attn", None)
-                gene_indices = outputs.get("gene_indices", None)
-            elif isinstance(outputs, (tuple, list)) and len(outputs) >= 2:
-                logits, mil_attn = outputs[0], outputs[1]
-                gene_attn, gene_indices = None, None
+        elif fusion_option == 'sim':
+            # 4D + 1 = img, st, product, abs_diff, cosine_sim
+            self.fuse = nn.Sequential(
+                nn.Linear(embed_dim * 4 + 1, embed_dim * 2),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(embed_dim * 2, embed_dim),
+                nn.LayerNorm(embed_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+            )
+
+        elif fusion_option == 'gate':
+            # Gated fusion
+            self.gate = nn.Sequential(
+                nn.Linear(embed_dim * 2, embed_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(embed_dim, 2),
+                nn.Softmax(dim=-1),
+            )
+            self.proj = nn.Linear(embed_dim, embed_dim)
+        
+        else:
+            raise ValueError(f"Unknown fusion_option: {fusion_option}")
+
+    def forward(self, img_feat, st_feat):
+        """
+        img_feat: (N, D)
+        st_feat: (N, D)
+        return: (N, D)
+        """
+        # Pre-norm
+        img_feat = self.pre_norm_img(img_feat)
+        st_feat = self.pre_norm_st(st_feat)
+
+        if self.fusion_option == 'concat':
+            # Simple concatenation
+            x = torch.cat([img_feat, st_feat], dim=-1)  # (N, 2D)
+            return self.fuse(x)  # (N, D)
+
+        elif self.fusion_option == 'attn':
+            # Cross-attention: [img, st] as 2 tokens
+            tokens = torch.stack([img_feat, st_feat], dim=1)  # (N, 2, D)
+            
+            # Self-attention
+            attn_out, _ = self.attn(tokens, tokens, tokens)  # (N, 2, D)
+            tokens = self.norm1(tokens + attn_out)
+            
+            # FFN
+            ffn_out = self.ffn(tokens)  # (N, 2, D)
+            tokens = self.norm2(tokens + ffn_out)
+            
+            # Pool (average)
+            pooled = tokens.mean(dim=1)  # (N, D)
+            return self.out_proj(pooled)
+
+        elif self.fusion_option == 'sim':
+            # Similarity-based features
+            if self.use_l2norm_for_sim:
+                img_n = F.normalize(img_feat, p=2, dim=-1, eps=1e-8)
+                st_n = F.normalize(st_feat, p=2, dim=-1, eps=1e-8)
             else:
-                logits = outputs
-                mil_attn = None
+                img_n = img_feat
+                st_n = st_feat
+            
+            # Cosine similarity
+            sim = F.cosine_similarity(img_n, st_n, dim=-1, eps=1e-8).unsqueeze(-1)  # (N, 1)
+            
+            # Element-wise product
+            prod = img_n * st_n  # (N, D)
+            
+            # Absolute difference
+            abs_diff = torch.abs(img_n - st_n)  # (N, D)
+            
+            # Concatenate all features
+            x = torch.cat([img_n, st_n, prod, abs_diff, sim], dim=-1)  # (N, 4D+1)
+            return self.fuse(x)  # (N, D)
+
+        elif self.fusion_option == 'gate':
+            # Gated fusion
+            x = torch.cat([img_feat, st_feat], dim=-1)  # (N, 2D)
+            weights = self.gate(x)  # (N, 2)
+            
+            # Weighted sum
+            fused = weights[:, 0:1] * img_feat + weights[:, 1:2] * st_feat  # (N, D)
+            return self.proj(fused)  # (N, D)
+
+# =======================================================
+# 4. MIL Attention Pooling (Spot → WSI)
+# =======================================================
+class MILAttentionPooling(nn.Module):
+    def __init__(self, embed_dim=256, hidden_dim=128):
+        super().__init__()
+        self.attn_V = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim),
+            nn.Tanh()
+        )
+        self.attn_U = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim),
+            nn.Sigmoid()
+        )
+        self.attn_w = nn.Linear(hidden_dim, 1)
+
+    def forward(self, spot_embeds):
+        """
+        spot_embeds: (N_spots, D)
+        """
+        A = self.attn_w(self.attn_V(spot_embeds) * self.attn_U(spot_embeds))
+        weights = F.softmax(A, dim=0)
+        wsi_embed = torch.sum(weights * spot_embeds, dim=0)
+        return wsi_embed, weights
+
+# =======================================================
+# 5. Linear Head
+# =======================================================
+class LinearHead(nn.Module):
+    def __init__(self, dim: int, use_ln: bool=True):
+        super().__init__()
+        self.ln = nn.LayerNorm(dim) if use_ln else nn.Identity()
+        self.fc = nn.Linear(dim, dim)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.fc(self.ln(x))
+      
+# =======================================================
+# 6. Full Multi-Modal MIL Model (Freeze 지원)
+# =======================================================
+class MultiModalMILModel(nn.Module):
+    def __init__(
+        self,
+        num_genes=2000,
+        num_classes=2,
+        embed_dim=256,
+        fusion_option='concat',
+        top_k_genes=None,
+        dropout=0.3,
+        freeze_image_encoder=True,
+        mil_hidden_dim=128,
+        mil_dropout=0.0,
+        fusion_dropout=0.2,
+        head_use_ln=True,
+
+        # ablation용
+        use_image =True,
+        use_st=True
+    ):
+        super().__init__()
+
+        assert use_image or use_st, "At least one modality must be used!!"
+        
+        self.use_image = use_image
+        self.use_st = use_st
+        self.fusion_option = fusion_option
+        self.freeze_image_encoder = freeze_image_encoder
+
+        # Ablation: conditional encoder
+        if self.use_image:
+            self.img_encoder = ImageEncoder(embed_dim)
+            self.img_head = LinearHead(dim=embed_dim, use_ln=head_use_ln)
+        else:
+            self.img_encoder = None
+            self.img_head = None
+
+        if self.use_st:
+            self.st_encoder = SpatialSTEncoder(
+                num_genes=num_genes,
+                embed_dim=embed_dim,
+                top_k_genes=top_k_genes,
+            )
+        else:
+            self.st_encoder = None
+        self.st_head = nn.Identity()
+
+        # Freeze
+        if self.use_image and freeze_image_encoder:
+            self.freeze_encoders()
+            
+        # Fusion
+        # Ablation: multimodal일 때만 fusion 생성
+        if self.use_image and self.use_st:
+            self.fusion = SpotFusionModule(
+                embed_dim=embed_dim,
+                fusion_option=fusion_option,
+                dropout=fusion_dropout,
+            )
+        else:
+            self.fusion = None
+
+        # MIL Pooling
+        self.mil_pooling = MILAttentionPooling(
+            embed_dim=embed_dim,
+            hidden_dim=mil_hidden_dim,
+        )
+
+        # Classifier
+        self.classifier = nn.Sequential(
+            nn.Linear(embed_dim, 128),
+            nn.LayerNorm(128),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(128, num_classes)
+        )
+        
+        print(f"✓ Model 1 initialized with fusion_option='{fusion_option}'")
+        if freeze_image_encoder:
+            print(f"✓ Image Encoder frozen (only img_head trainable)")
+
+    def freeze_encoders(self):
+        """ResNet backbone만 freeze"""
+        if self.img_encoder is None:    # Ablation
+            return
+        for param in self.img_encoder.parameters():
+            param.requires_grad = False
+        self.img_encoder.eval()
+    
+    def train(self, mode: bool=True):
+        """Keep image encoder as eval during training"""
+        super().train(mode)
+        if self.use_image and self.freeze_image_encoder:
+            self.img_encoder.eval()
+
+    def forward(self, images, expr, coords, return_gene_attn=True, return_spot_embeds=True):
+        """
+        images: (N_spots, 3, 224, 224)
+        expr  : (N_spots, K)
+        coords: (N_spots, 2)
+        
+        Returns:
+          logits: (num_classes,)
+          attn: (N_spots, 1)
+        """
+        spot_embeds = None
+
+        gene_attn = None
+        gene_indices = None
+        
+        # Ablation: conditional encoding
+        if self.use_image:  # img branch
+            if self.freeze_image_encoder:
+                with torch.no_grad():
+                    img_feat = self.img_encoder(images)
+            else:
+                img_feat = self.img_encoder(images)
+            img_feat = self.img_head(img_feat)  # FC layer (trainable)
+
+        if self.use_st:     # st branch
+            if return_gene_attn:
+                st_feat, gene_attn, gene_indices = self.st_encoder(expr, coords, return_gene_attn=True)
+            else:
+                st_feat = self.st_encoder(expr, coords, return_gene_attn=False)
                 gene_attn, gene_indices = None, None
+        
+        # Ablation: process spot embedding per modality
+        if self.use_image and self.use_st:  # Both modalities: Fusion
+            spot_embeds = self.fusion(img_feat, st_feat)
+        elif self.use_image:    # Image only
+            spot_embeds = img_feat
+        elif self.use_st:       # ST only
+            spot_embeds = st_feat
 
-            probs = F.softmax(logits, dim=-1).detach().cpu().numpy().tolist()
-            pred = int(np.argmax(probs))
-            n_spots = int(images.shape[0])
+        # MIL Pooling
+        wsi_embed, mil_attn = self.mil_pooling(spot_embeds)
+        mil_attn = mil_attn.squeeze(-1)  # (N_spots,)
 
-            # attention이 없으면 XAI가 불가하므로 최소한 pred만 저장
-            if mil_attn is None:
-                summary = {
-                    "sample_id": sample_id,
-                    "gt_label": label,
-                    "pred_label": pred,
-                    "probs": probs,
-                    "num_spots_used": n_spots,
-                    "mil_attn_available": False,
-                    "note": "Model did not return mil_attn. Patch ranking/heatmap skipped."
-                }
-                with open(os.path.join(out_dir, "pred.json"), "w") as f:
-                    json.dump(summary, f, indent=2)
-                continue
+        # Classification
+        logits = self.classifier(wsi_embed)
+        
+        out = {
+            "logits": logits,
+            "mil_attn": mil_attn,
+            "gene_attn": gene_attn,
+            "gene_indices": gene_indices,
+        }
+        if return_spot_embeds:
+            out["spot_embeds"] = spot_embeds
 
-            mil_attn = mil_attn.view(-1)
-
-            # Top-10 important spots
-            top10 = torch.topk(mil_attn, k=min(10, n_spots)).indices.detach().cpu().tolist()
-
-            summary = {
-                "sample_id": sample_id,
-                "gt_label": label,
-                "pred_label": pred,
-                "probs": probs,
-                "num_spots_used": n_spots,
-                "top10_spot_indices": top10,
-                "barcodes_available": barcodes is not None,
-                "patch_indices_available": patch_indices is not None,
-                "coords_raw_available": coords_raw is not None,
-                "gene_xai_available": (gene_attn is not None and gene_indices is not None),
-            }
-            with open(os.path.join(out_dir, "pred.json"), "w") as f:
-                json.dump(summary, f, indent=2)
-
-            # (1) Top-k patches 저장
-            k = min(args.topk_patches, n_spots)
-            topk = torch.topk(mil_attn, k=k).indices.detach().cpu().tolist()
-
-            patch_dir = os.path.join(out_dir, "top_patches")
-            os.makedirs(patch_dir, exist_ok=True)
-
-            for rank, i in enumerate(topk, start=1):
-                fn = f"rank{rank:02d}_idx{i}"
-                if barcodes is not None:
-                    fn += f"_bc{barcodes[i]}"
-                if patch_indices is not None:
-                    fn += f"_pidx{int(patch_indices[i])}"
-                fn += ".png"
-                save_patch_image(images[i], os.path.join(patch_dir, fn))
-
-            # (2) attention scatter (coords_raw 기반)
-            if coords_raw is not None:
-                plot_attention_scatter(
-                    coords_raw=coords_raw,
-                    attn=mil_attn.detach().cpu(),
-                    top10_idx=top10,
-                    out_path=os.path.join(out_dir, "patch_attn_scatter_top10.png"),
-                    title="Patch importance (MIL attn) + Top10"
-                )
-
-            # (3) gene top list (가능할 때만)
-            if gene_attn is not None and gene_indices is not None and len(gene_order) > 0:
-                # gene_attn: (N,1,G) or (N,G)
-                if gene_attn.dim() == 3:
-                    gene_attn2 = gene_attn.squeeze(1)
-                else:
-                    gene_attn2 = gene_attn
-
-                top_genes = aggregate_top_genes(
-                    gene_attn=gene_attn2,
-                    gene_indices=gene_indices,
-                    mil_attn=mil_attn.detach().cpu(),
-                    gene_order=gene_order,
-                    topk=args.topk_genes
-                )
-                with open(os.path.join(out_dir, "top_genes.csv"), "w") as f:
-                    f.write("rank,gene,score\n")
-                    for r, (g, sc) in enumerate(top_genes, start=1):
-                        f.write(f"{r},{g},{sc:.6f}\n")
-
-    print(f"Done. Outputs saved to: {args.out_dir}")
-
-
-if __name__ == "__main__":
-    main()
+        return out

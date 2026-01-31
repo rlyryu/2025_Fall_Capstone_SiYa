@@ -20,7 +20,6 @@ class ImageEncoder(nn.Module):
         """
         return self.backbone(x)
 
-
 # =======================================================
 # 2. Spatial ST Encoder (HVG-only, scBERT-style)
 # =======================================================
@@ -105,9 +104,10 @@ class SpatialSTEncoder(nn.Module):
         N, K = expr.shape
         device = expr.device
 
-        # ✅ Top-K gene selection (메모리 절약)
+        # Top-K gene selection
         if self.top_k_genes and self.top_k_genes < K:
-            # 각 spot에서 expression 값이 높은 상위 K개만 선택
+            
+            # extract top-K expression genes per spot
             topk_values, topk_indices = torch.topk(expr, k=self.top_k_genes, dim=1)
             gene_indices = topk_indices.long()  # global gene ids
 
@@ -116,7 +116,6 @@ class SpatialSTEncoder(nn.Module):
             value_emb = self.value_embedding(topk_values.unsqueeze(-1))
             gene_tokens = gene_embed + gene_pos + value_emb
         else:
-            # 원래 방식: 모든 gene 사용
             gene_ids = torch.arange(K, device=device).unsqueeze(0).expand(N, -1).long()
             gene_embed = self.gene_embedding(gene_indices)
             gene_pos = self.gene_pos_embedding(gene_indices)
@@ -148,7 +147,6 @@ class SpatialSTEncoder(nn.Module):
             return pooled, gene_attn, gene_indices
         else:
             return pooled
-
 
 # =======================================================
 # 3. Spot Fusion Module (4 options: concat, attn, sim, gate)
@@ -293,7 +291,6 @@ class SpotFusionModule(nn.Module):
             fused = weights[:, 0:1] * img_feat + weights[:, 1:2] * st_feat  # (N, D)
             return self.proj(fused)  # (N, D)
 
-
 # =======================================================
 # 4. MIL Attention Pooling (Spot → WSI)
 # =======================================================
@@ -319,9 +316,8 @@ class MILAttentionPooling(nn.Module):
         wsi_embed = torch.sum(weights * spot_embeds, dim=0)
         return wsi_embed, weights
 
-
 # =======================================================
-# 5. Linear Head (Image Encoder 뒤에 붙일 FC layer)
+# 5. Linear Head (FC layer after image encoder)
 # =======================================================
 class LinearHead(nn.Module):
     def __init__(self, dim: int, use_ln: bool=True):
@@ -332,9 +328,8 @@ class LinearHead(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.fc(self.ln(x))
     
-    
 # =======================================================
-# 6. Full Multi-Modal MIL Model (Freeze 지원)
+# 6. Full Multi-Modal MIL Model (support freeze)
 # =======================================================
 class MultiModalMILModel(nn.Module):
     def __init__(
@@ -345,7 +340,7 @@ class MultiModalMILModel(nn.Module):
         fusion_option='concat',
         top_k_genes=None,
         dropout=0.3,
-        freeze_image_encoder=True,  # ✅ 추가
+        freeze_image_encoder=True,
         mil_hidden_dim=128,
         mil_dropout=0.0,
         fusion_dropout=0.2,
@@ -356,11 +351,11 @@ class MultiModalMILModel(nn.Module):
         self.fusion_option = fusion_option
         self.freeze_image_encoder = freeze_image_encoder
 
-        # ✅ Image Encoder + Head (freeze 가능)
+        # Image Encoder + Head (allow freeze)
         self.img_encoder = ImageEncoder(embed_dim)
-        self.img_head = LinearHead(dim=embed_dim, use_ln=head_use_ln)  # ✅ 추가
+        self.img_head = LinearHead(dim=embed_dim, use_ln=head_use_ln)
         
-        # ST Encoder (항상 학습)
+        # ST Encoder
         self.st_encoder = SpatialSTEncoder(
             num_genes=num_genes,
             embed_dim=embed_dim,
@@ -368,7 +363,7 @@ class MultiModalMILModel(nn.Module):
         )
         self.st_head = nn.Identity()
 
-        # ✅ Freeze 적용
+        # Freeze
         if freeze_image_encoder:
             self.freeze_encoders()
 
@@ -394,9 +389,9 @@ class MultiModalMILModel(nn.Module):
             nn.Linear(128, num_classes)
         )
         
-        print(f"✓ Model 1 initialized with fusion_option='{fusion_option}'")
+        print(f"Model 1 initialized with fusion_option='{fusion_option}'")
         if freeze_image_encoder:
-            print(f"✓ Image Encoder frozen (only img_head trainable)")
+            print(f"Image Encoder frozen (only img_head trainable)")
 
     def freeze_encoders(self):
         """ResNet backbone만 freeze"""
@@ -405,7 +400,7 @@ class MultiModalMILModel(nn.Module):
         self.img_encoder.eval()
     
     def train(self, mode: bool=True):
-        """Training 모드에서도 Image Encoder는 eval 유지"""
+        """Keep image encoder as eval during training"""
         super().train(mode)
         if self.freeze_image_encoder:
             self.img_encoder.eval()
@@ -453,6 +448,6 @@ class MultiModalMILModel(nn.Module):
             "gene_indices": gene_indices,
         }
         if return_spot_embeds:
-            out["spot_embeds"] = spot_embeds  # <- 추가
-
+            out["spot_embeds"] = spot_embeds
+            
         return out

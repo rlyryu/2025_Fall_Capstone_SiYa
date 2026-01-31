@@ -11,9 +11,7 @@ from dataset.loader import CustomSample, create_wsi_dataloader, load_global_gene
 from models.model_ablation import MultiModalMILModel
 
 """
-- wsi에서 중요도 높은 패치 보여주기(img)
-- 중요도 높은 gene들 뽑아주기(expr)
-- 중요도 높은 스팟 보여주기 (st)
+An ablation ver. of test.py
 """
 
 # Detect samples -> return
@@ -34,7 +32,6 @@ def discover_samples(root_dir):
 
     samples = [CustomSample(root_dir, sid) for sid in sample_ids]
     return samples
-
 
 # UMAP/PCA util
 def compute_2d_embedding(X: np.ndarray, method: str = "umap", seed: int = 0):
@@ -70,14 +67,14 @@ def make_top_percent_mask(attn: torch.Tensor, top_percent: float = 0.6, min_poin
     if N == 0:
         return torch.zeros_like(attn, dtype=torch.bool)
 
-    # 상위 n%를 남기려면 threshold는 하위 (100-n)% 지점(=quantile (1-n/100))
+    # Apply threshold -> top 70%
     q = 1.0 - float(top_percent)
     q = min(max(q, 0.0), 1.0)
 
     thr = torch.quantile(attn, q)
     mask = attn >= thr
 
-    # fallback: 너무 적게 선택되면 top-k로 보장
+    # fallback: top-k
     if mask.sum().item() < min_points:
         k = min(min_points, N)
         idx = torch.topk(attn, k=k).indices
@@ -96,7 +93,7 @@ def save_patch_image(tensor_chw, out_path):
     Image.fromarray(x).save(out_path)
 
 
-# attention score 높은 patch plot
+# Patches with high attn score -> scatter plot
 def plot_attention_scatter(coords_raw, attn, top10_idx, out_path,
                            title="Spot importance (MIL attn)",
                            mask=None):
@@ -117,7 +114,6 @@ def plot_attention_scatter(coords_raw, attn, top10_idx, out_path,
     a = a_all[m]
 
     if len(a) == 0:
-        # 안전장치: 백지 저장 (원하면 return만 해도 됨)
         plt.figure()
         plt.title(title + " (empty after masking)")
         plt.tight_layout()
@@ -133,7 +129,6 @@ def plot_attention_scatter(coords_raw, attn, top10_idx, out_path,
     plt.figure()
     plt.scatter(c[:, 0], c[:, 1], s=sizes)  # 백지 위 scatter
 
-    # Top10도 mask에 포함된 점만
     if top10_idx is not None and len(top10_idx) > 0:
         sel = np.array(top10_idx, dtype=np.int64)
         sel = sel[sel < len(m)]          # boundary safety
@@ -151,7 +146,7 @@ def plot_attention_scatter(coords_raw, attn, top10_idx, out_path,
     plt.savefig(out_path, dpi=200)
     plt.close()
 
-# 중요도 높은 gene 집계
+# Important gene list
 def aggregate_top_genes(gene_attn, gene_indices, mil_attn, gene_order, topk=30):
     """
     gene_attn: (N, G) torch.Tensor (per-spot attention over gene tokens)
@@ -178,7 +173,6 @@ def aggregate_top_genes(gene_attn, gene_indices, mil_attn, gene_order, topk=30):
         out.append((gname, sc))
     return out
 
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--root_dir", type=str, required=True)
@@ -186,7 +180,7 @@ def main():
     parser.add_argument("--out_dir", type=str, default="./xai_outputs")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
 
-    # model params (일단 train과 통일)
+    # model params
     parser.add_argument("--num_genes", type=int, default=2000)
     parser.add_argument("--num_classes", type=int, default=2)
     parser.add_argument("--embed_dim", type=int, default=256)
@@ -204,11 +198,11 @@ def main():
     parser.add_argument("--topk_genes", type=int, default=30)
     parser.add_argument("--embed_2d", type=str, default="umap", choices=["umap", "pca"])
 
-    # 예시 args (로컬 디버깅용, 수정할 것!!!)
+    # for local debugging
     args = parser.parse_args(args=[
-        "--root_dir", r"C:\Users\rdh08\Desktop\Capstone\src2\hest_data",
-        "--ckpt", r"C:\Users\rdh08\Desktop\Capstone\src2\best_model_st_concat.pt",
-        # "--use_image",
+        "--root_dir", r"\src2\hest_data",
+        "--ckpt", r"src2\best_model_img_concat.pt",
+        "--use_image",
         "--use_st",
     ])
 
@@ -244,7 +238,7 @@ def main():
         shuffle=False,
         max_spots=args.max_spots,
         root_dir=args.root_dir,
-        return_trace=True,  # loader 수정본 기준
+        return_trace=True,
     )
 
     # gene order (fallback)
@@ -275,6 +269,9 @@ def main():
         state = ckpt
 
     missing, unexpected = model.load_state_dict(state, strict=False)
+    print("missing sample:", missing[:30])
+    print("unexpected sample:", unexpected[:30])
+
     print(f"[load] missing keys: {len(missing)}, unexpected keys: {len(unexpected)}")
 
     model.eval()
@@ -300,7 +297,7 @@ def main():
             coords_raw = batch.get("coords_raw", None)        # torch.Tensor (N,2)
             gene_order = batch.get("gene_order", global_gene_order)
 
-            # gene attn은 ST 켜졌을 때만 요청
+            # gene attn - only for ST
             outputs = model(
                 images,
                 expr,
@@ -326,13 +323,13 @@ def main():
             probs = F.softmax(logits, dim=-1).detach().cpu().numpy().tolist()
             pred = int(np.argmax(probs))
 
-            # n_spots: 이미지/expr 중 존재하는 것 기준
+            # n_spots: 
             if args.use_image:
                 n_spots = int(images.shape[0])
             else:
                 n_spots = int(expr.shape[0])
 
-            # summary 먼저 저장
+            # summary 
             summary = {
                 "sample_id": sample_id,
                 "gt_label": label,
@@ -348,7 +345,6 @@ def main():
             with open(os.path.join(out_dir, "pred.json"), "w") as f:
                 json.dump(summary, f, indent=2)
 
-            # mil_attn 없으면 XAI 대부분 skip
             if mil_attn is None:
                 continue
 
@@ -357,7 +353,7 @@ def main():
             # Top-10 important spots
             top10 = torch.topk(mil_attn, k=min(10, n_spots)).indices.detach().cpu().tolist()
 
-            # UMAP/PCA: spot_embeds 있을 때만
+            # UMAP/PCA
             if spot_embeds is not None:
                 X = spot_embeds.detach().cpu().numpy()
                 Z = compute_2d_embedding(X, method=args.embed_2d, seed=0)
@@ -367,7 +363,6 @@ def main():
                 denom = (a_max - a_min) if (a_max - a_min) > 1e-12 else 1.0
                 a_n = (a - a_min) / denom
 
-                # 단색(size only)
                 plt.figure()
                 plt.scatter(Z[:, 0], Z[:, 1], s=10 + 200 * a_n)
                 plt.title(f"{args.embed_2d.upper()} of spot embeddings (size=mil_attn)")
@@ -377,7 +372,6 @@ def main():
                 plt.savefig(os.path.join(out_dir, f"spot_embeds_{args.embed_2d}.png"), dpi=200)
                 plt.close()
 
-                # 색 + 크기
                 plt.figure()
                 plt.scatter(
                     Z[:, 0], Z[:, 1],
@@ -393,7 +387,7 @@ def main():
                 plt.savefig(os.path.join(out_dir, f"spot_embeds_{args.embed_2d}_color.png"), dpi=200)
                 plt.close()
 
-            # Top-k patches 저장: 이미지 있을 때만
+            # Top-k patches
             if args.use_image and images is not None:
                 k = min(args.topk_patches, n_spots)
                 topk = torch.topk(mil_attn, k=k).indices.detach().cpu().tolist()
@@ -410,7 +404,6 @@ def main():
                     fn += ".png"
                     save_patch_image(images[i], os.path.join(patch_dir, fn))
 
-            # attention scatter (coords_raw 기반) — coords_raw는 st에서 오는 경우가 많지만, loader가 주면 그냥 사용
             if coords_raw is not None:
                 mask70 = make_top_percent_mask(mil_attn, top_percent=0.7, min_points=20)
 
@@ -423,7 +416,6 @@ def main():
                     mask=mask70
                 )
 
-            # (D) gene top list: ST 켜져 있고 gene_attn/gene_indices 있을 때만
             if args.use_st and (gene_attn is not None) and (gene_indices is not None) and (len(gene_order) > 0):
                 # gene_attn: (N,1,G) or (N,G)
                 if gene_attn.dim() == 3:
@@ -444,7 +436,6 @@ def main():
                         f.write(f"{r},{g},{sc:.6f}\n")
 
     print(f"Done. Outputs saved to: {args.out_dir}")
-
 
 if __name__ == "__main__":
     main()

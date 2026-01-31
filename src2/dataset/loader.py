@@ -19,9 +19,8 @@ def load_global_gene_order(root_dir):
         print(f"✓ Loaded global gene order: {len(global_genes)} genes")
         return global_genes
     else:
-        print("⚠️  global_hvg_genes_unified.txt not found, will infer from first sample")
+        print("global_hvg_genes_unified.txt not found, will infer from first sample")
         return None
-
 
 # -------------------------------------------------------
 # Custom Sample class
@@ -50,7 +49,6 @@ class CustomSample:
             return 0
         return int(val)
 
-
 # -------------------------------------------------------
 # WSI-level Dataset (unified gene order + zero-padding)
 # -------------------------------------------------------
@@ -78,7 +76,7 @@ class WSIDataset(Dataset):
             adata = sc.read_h5ad(samples[0].st_path, backed="r")
             self.global_gene_order = adata.var_names.tolist()
             del adata
-            print(f"✓ Using {len(self.global_gene_order)} genes as reference order")
+            print(f"Using {len(self.global_gene_order)} genes as reference order")
 
     def __len__(self):
         return len(self.samples)
@@ -253,7 +251,7 @@ class WSIDataset(Dataset):
             return out
 
         except Exception as e:
-            print(f"⚠️ Error loading {sample.sample_id}: {e}")
+            print(f"Error loading {sample.sample_id}: {e}")
             import traceback
             print(traceback.format_exc())
             raise
@@ -348,4 +346,4 @@ def validate_dataloader(loader, num_batches=5):
         if "patch_indices" in batch:
             print(f"  Trace keys: patch_indices({len(batch['patch_indices'])}), st_indices({len(batch['st_indices'])}), barcodes({len(batch['barcodes'])})")
 
-    print("\n✓ Validation complete")
+    print("\nValidation complete")

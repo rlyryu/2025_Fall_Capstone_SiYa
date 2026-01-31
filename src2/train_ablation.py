@@ -1,483 +1,441 @@
-import warnings
-warnings.filterwarnings('ignore')
-
-from sklearn.metrics import (
-    roc_auc_score, roc_curve,
-    precision_recall_fscore_support,
-    confusion_matrix
-)
-import matplotlib.pyplot as plt
-import numpy as np
-
-import yaml
 import os
+import json
+import argparse
+import numpy as np
 import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.cuda.amp import autocast, GradScaler
-from tqdm import tqdm
-from sklearn.model_selection import train_test_split
-from contextlib import nullcontext
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+from PIL import Image
 
-from dataset.loader import CustomSample, create_wsi_dataloader
+from dataset.loader import CustomSample, create_wsi_dataloader, load_global_gene_order
 from models.model_ablation import MultiModalMILModel
 
+"""
+An ablation ver. of test.py
+"""
 
-# ===============================================
-# YAML Config Loader
-# ===============================================
-def load_config(path="configs/train_ablation.yaml"):
-    with open(path, "r") as f:
-        cfg = yaml.safe_load(f)
-
-    CONFIG = {
-        # Data
-        "root_dir": cfg["data"]["root_dir"],
-        "max_spots": cfg["data"]["max_spots"],
-
-        # Model
-        "num_genes": cfg["model"]["num_genes"],
-        "num_classes": cfg["model"]["num_classes"],
-        "embed_dim": cfg["model"]["embed_dim"],
-        "fusion_option": cfg["model"].get("fusion_option", "concat"),
-        "top_k_genes": cfg["model"].get("top_k_genes"),
-
-        # ✅ Ablation flags (default: multimodal)
-        "use_image": cfg["model"].get("use_image", True),
-        "use_st": cfg["model"].get("use_st", True),
-
-        # Training
-        "epochs": cfg["training"]["epochs"],
-        "lr": cfg["training"]["lr"],
-        "weight_decay": cfg["training"]["weight_decay"],
-        "batch_size": cfg["training"]["batch_size"],
-
-        # Memory
-        "batch_spots": cfg["memory"]["batch_spots"],
-        "accum_steps": cfg["memory"]["accum_steps"],
-        "freeze_image_encoder": cfg["memory"]["freeze_image_encoder"],
-
-        # Misc
-        "device": cfg["misc"]["device"],
-        "seed": cfg["misc"]["seed"],
-        "checkpoint_freq": cfg["misc"]["checkpoint_freq"],
-    }
-
-    assert CONFIG["use_image"] or CONFIG["use_st"], "At least one modality must be enabled"
-    return CONFIG
-
-
-# ===============================================
-# Utils
-# ===============================================
-def set_seed(seed):
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    import numpy as np
-    np.random.seed(seed)
-
-def plot_confusion_matrix(
-  cm, 
-  class_names=('0', '1'),
-  title="Confusion Matrix",
-  save_path = None
-):
-    """
-    cm: np.array shape (2, 2) [[TN, FP]. [FN, TP]]
-    """
-    fig, ax = plt.subplots(figsize=(4, 4))
-    im = ax.imshow(cm)
-
-    # ticks / labels
-    ax.set_xticks(np.arange(len(class_names)))
-    ax.set_yticks(np.arange(len(class_names)))
-    ax.set_xticklabels(class_names)
-    ax.set_yticklabels(class_names)
-
-    ax.set_xlabel("Predicted label")
-    ax.set_ylabel("True label")
-    ax.set_title(title)
-
-    # 숫자 표시
-    for i in range(cm.shape[0]):
-        for j in range(cm.shape[1]):
-            ax.text(
-                j, i, cm[i, j],
-                ha="center", va="center",
-                fontsize=12
-            )
-    
-    fig.tight_layout()
-
-    if save_path is not None:
-        plt.savefig(save_path, dpi=200)
-        plt.close(fig)
-    else:
-        plt.show()
-
-# ===============================================
-# Data Split
-# ===============================================
-def prepare_data_splits(root_dir, seed=42):
+# Detect samples -> return
+def discover_samples(root_dir):
     st_dir = os.path.join(root_dir, "st_preprocessed_global_hvg")
     patch_dir = os.path.join(root_dir, "patches")
 
-    st_files = {f.replace('.h5ad', '') for f in os.listdir(st_dir) if f.endswith('.h5ad')}
-    patch_files = {f.replace('.h5', '') for f in os.listdir(patch_dir) if f.endswith('.h5')}
-    valid_ids = sorted(st_files & patch_files)
+    assert os.path.isdir(st_dir), f"ST dir not found: {st_dir}"
+    assert os.path.isdir(patch_dir), f"Patch dir not found: {patch_dir}"
 
-    print(f"Found {len(valid_ids)} valid samples")
+    sample_ids = []
+    for fn in os.listdir(st_dir):
+        if fn.endswith(".h5ad"):
+            sid = fn[:-5]
+            if os.path.exists(os.path.join(patch_dir, f"{sid}.h5")):
+                sample_ids.append(sid)
+    sample_ids.sort()
 
-    samples, labels = [], []
-    for sid in valid_ids:
+    samples = [CustomSample(root_dir, sid) for sid in sample_ids]
+    return samples
+
+# UMAP/PCA util
+def compute_2d_embedding(X: np.ndarray, method: str = "umap", seed: int = 0):
+    """
+    X: (N, D)
+    returns: (N, 2)
+    """
+    if method == "umap":
         try:
-            sample = CustomSample(root_dir, sid)
-            if sample.label in [0, 1]:
-                samples.append(sample)
-                labels.append(sample.label)
-            else:
-                print(f"⚠️  Skipping {sid} (label={sample.label})")
+            import umap
+            reducer = umap.UMAP(n_components=2, random_state=seed)
+            return reducer.fit_transform(X)
         except Exception as e:
-            print(f"Failed to load {sid}: {e}")
+            print(f"[warn] UMAP not available ({e}). Falling back to PCA.")
+            method = "pca"
 
-    from collections import Counter
-    label_counts = Counter(labels)
-    print("\nLabel distribution:")
-    for label, count in sorted(label_counts.items()):
-        print(f"  Class {label}: {count} ({100*count/len(labels):.1f}%)")
+    if method == "pca":
+        from sklearn.decomposition import PCA
+        return PCA(n_components=2, random_state=seed).fit_transform(X)
 
-    train_samples, val_samples = train_test_split(
-        samples,
-        test_size=0.3,
-        stratify=labels,
-        random_state=seed
-    )
-    
-    # data leakage 체크
-    train_ids = {s.sample_id for s in train_samples}
-    val_ids   = {s.sample_id for s in val_samples}
-    inter = train_ids & val_ids
-    print("Overlap train/val:", len(inter))
-    if len(inter) > 0:
-        print("Examples:", list(sorted(inter))[:10])
+    raise ValueError(f"Unknown method: {method}")
 
-    print(f"\nSplit: {len(train_samples)} train, {len(val_samples)} val")
-    return train_samples, val_samples
-
-
-# ===============================================
-# Spot encoding helper (chunk-wise, ablation-aware)
-# ===============================================
-def encode_spots_chunkwise(model, batch, config, device):
+# top percent attn extraction util
+def make_top_percent_mask(attn: torch.Tensor, top_percent: float = 0.6, min_points: int = 10):
     """
-    Returns:
-      spot_embeds: (N_spots, D) on GPU
+    attn: (N,) torch.Tensor
+    top_percent: keep top 70% => 0.7
+    min_points: safety fallback (avoid empty / too few)
+    returns: mask (N,) bool torch.Tensor
     """
-    use_image = config["use_image"]
-    use_st = config["use_st"]
-    freeze_img = config["freeze_image_encoder"]
+    attn = attn.view(-1)
+    N = attn.numel()
+    if N == 0:
+        return torch.zeros_like(attn, dtype=torch.bool)
 
-    images = batch["images"] if use_image else None
-    expr = batch["expr"] if use_st else None
-    coords = batch["coords"] if use_st else None
+    # Apply threshold -> top 70%
+    q = 1.0 - float(top_percent)
+    q = min(max(q, 0.0), 1.0)
 
-    # N_spots: choose from whichever exists
-    if use_image:
-        N = images.size(0)
+    thr = torch.quantile(attn, q)
+    mask = attn >= thr
+
+    # fallback: top-k
+    if mask.sum().item() < min_points:
+        k = min(min_points, N)
+        idx = torch.topk(attn, k=k).indices
+        mask = torch.zeros(N, dtype=torch.bool, device=attn.device)
+        mask[idx] = True
+
+    return mask
+
+# IO utils
+def save_patch_image(tensor_chw, out_path):
+    """
+    tensor_chw: torch.Tensor (3,H,W), range ~[0,1]
+    """
+    x = tensor_chw.detach().cpu().clamp(0, 1)
+    x = (x.permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+    Image.fromarray(x).save(out_path)
+
+
+# Patches with high attn score -> scatter plot
+def plot_attention_scatter(coords_raw, attn, top10_idx, out_path,
+                           title="Spot importance (MIL attn)",
+                           mask=None):
+    """
+    coords_raw: (N,2) torch.Tensor
+    attn: (N,) torch.Tensor
+    mask: (N,) bool torch.Tensor (True만 plot)
+    """
+    c_all = coords_raw.detach().cpu().numpy()
+    a_all = attn.detach().cpu().numpy()
+
+    if mask is not None:
+        m = mask.detach().cpu().numpy().astype(bool)
     else:
-        N = expr.size(0)
+        m = np.ones(len(a_all), dtype=bool)
 
-    spot_embeds_list = []
+    c = c_all[m]
+    a = a_all[m]
 
-    use_amp = config["use_image"]
-    amp_ctx = autocast() if use_amp else nullcontext()
+    if len(a) == 0:
+        plt.figure()
+        plt.title(title + " (empty after masking)")
+        plt.tight_layout()
+        plt.savefig(out_path, dpi=200)
+        plt.close()
+        return
 
-    for i in range(0, N, config["batch_spots"]):
-        j = min(i + config["batch_spots"], N)
+    a_min, a_max = float(a.min()), float(a.max())
+    denom = (a_max - a_min) if (a_max - a_min) > 1e-12 else 1.0
+    a_n = (a - a_min) / denom
+    sizes = 10 + 200 * a_n
 
-        img_b = images[i:j].to(device) if use_image else None
-        expr_b = expr[i:j].to(device) if use_st else None
-        coord_b = coords[i:j].to(device) if use_st else None
+    plt.figure()
+    plt.scatter(c[:, 0], c[:, 1], s=sizes)  # 백지 위 scatter
 
-        with amp_ctx:
-            # ----- Image branch -----
-            if use_image:
-                if freeze_img:
-                    with torch.no_grad():
-                        img_feat = model.img_encoder(img_b)
-                else:
-                    img_feat = model.img_encoder(img_b)
-                # img_head always trainable (exists when use_image=True)
-                img_feat = model.img_head(img_feat)
-            else:
-                img_feat = None
+    if top10_idx is not None and len(top10_idx) > 0:
+        sel = np.array(top10_idx, dtype=np.int64)
+        sel = sel[sel < len(m)]          # boundary safety
+        sel = sel[m[sel]]                # mask 통과한 top10만 남김
+        if len(sel) > 0:
+            plt.scatter(c_all[sel, 0], c_all[sel, 1], s=250, marker="x")
+            for rank, i in enumerate(sel.tolist(), start=1):
+                plt.text(c_all[i, 0], c_all[i, 1], f"Top{rank}", fontsize=10)
 
-            # ----- ST branch -----
-            if use_st:
-                # training에서는 gene_attn 필요 없으니 return_gene_attn=False로 두는 게 빠름
-                st_feat = model.st_encoder(expr_b, coord_b, return_gene_attn=False) \
-                    if "return_gene_attn" in model.st_encoder.forward.__code__.co_varnames \
-                    else model.st_encoder(expr_b, coord_b)
-            else:
-                st_feat = None
+    plt.title(title)
+    plt.xlabel("x")
+    plt.ylabel("y")
+    plt.gca().invert_yaxis()
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=200)
+    plt.close()
 
-            # ----- Routing -----
-            if use_image and use_st:
-                # multimodal
-                fused = model.fusion(img_feat, st_feat)
-                spot_embeds_chunk = fused
-            elif use_image:
-                # image-only
-                spot_embeds_chunk = img_feat
-            else:
-                # st-only
-                spot_embeds_chunk = st_feat
+# Important gene list
+def aggregate_top_genes(gene_attn, gene_indices, mil_attn, gene_order, topk=30):
+    """
+    gene_attn: (N, G) torch.Tensor (per-spot attention over gene tokens)
+    gene_indices: (N, G) torch.LongTensor
+    mil_attn: (N,) torch.Tensor  (spot importance)
+    gene_order: list[str] length K_global
+    """
+    N, G = gene_attn.shape
+    mil_w = mil_attn.view(N, 1)
 
-        # spot_embeds_list.append(spot_embeds_chunk.detach().cpu())
-        spot_embeds_list.append(spot_embeds_chunk)
+    contrib = (gene_attn * mil_w).detach().cpu().numpy()  # (N,G)
+    gidx = gene_indices.detach().cpu().numpy().astype(np.int64)
 
-        # cleanup
+    scores = {}  # gene_id -> sum score
+    for i in range(N):
+        for j in range(G):
+            gid = int(gidx[i, j])
+            scores[gid] = scores.get(gid, 0.0) + float(contrib[i, j])
 
-        if use_image:
-            del img_b, img_feat
-        if use_st:
-            del expr_b, coord_b, st_feat
+    items = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:topk]
+    out = []
+    for gid, sc in items:
+        gname = gene_order[gid] if (0 <= gid < len(gene_order)) else f"gene_{gid}"
+        out.append((gname, sc))
+    return out
 
-        del spot_embeds_chunk
-        torch.cuda.empty_cache()
-
-    # spot_embeds = torch.cat(spot_embeds_list, dim=0).to(device)
-    spot_embeds = torch.cat(spot_embeds_list, dim=0)
-
-    return spot_embeds
-
-
-# ===============================================
-# Training / Validation
-# ===============================================
-def train_epoch(model, loader, criterion, optimizer, scaler, config, device):
-    model.train()
-    if config["freeze_image_encoder"] and config["use_image"]:
-        model.img_encoder.eval()
-
-    epoch_loss, correct = 0.0, 0
-    optimizer.zero_grad()
-
-    loop = tqdm(loader, desc="Training")
-
-    use_amp = config["use_image"]
-    amp_ctx = autocast() if use_amp else nullcontext()
-
-    for step, batch in enumerate(loop):
-        label = batch["label"].to(device)
-
-        # (1) chunk-wise spot encoding with modality routing
-        spot_embeds = encode_spots_chunkwise(model, batch, config, device)
-
-        # (2) MIL + classifier (same for all ablations)
-        with amp_ctx:
-            wsi_embed, _ = model.mil_pooling(spot_embeds)
-            logits = model.classifier(wsi_embed.unsqueeze(0)).squeeze(0)
-            loss = criterion(logits.unsqueeze(0), label.unsqueeze(0))
-            loss = loss / config["accum_steps"]
-
-        if use_amp:
-            scaler.scale(loss).backward()
-        else:
-            loss.backward()
-
-        if (step + 1) % config["accum_steps"] == 0:
-            if use_amp:
-                scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(
-                filter(lambda p: p.requires_grad, model.parameters()), 1.0
-            )
-
-            if use_amp:
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                optimizer.step()
-            optimizer.zero_grad()
-
-        epoch_loss += loss.item() * config["accum_steps"]
-        correct += int(logits.argmax().item() == label.item())
-
-        loop.set_postfix(
-            loss=f"{epoch_loss/(step+1):.4f}",
-            acc=f"{100*correct/(step+1):.1f}%"
-        )
-
-        del spot_embeds, wsi_embed, logits, loss
-        torch.cuda.empty_cache()
-        
-    # after loop ends: flush remaining grads once
-    if (step + 1) % config["accum_steps"] != 0:
-        if use_amp:
-            scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(
-            filter(lambda p: p.requires_grad, model.parameters()), 1.0
-        )
-        if use_amp:
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            optimizer.step()
-        optimizer.zero_grad()
-        
-    return epoch_loss / len(loader), 100 * correct / len(loader)
-
-
-@torch.no_grad()
-def validate(model, loader, criterion, config, device):
-    model.eval()
-    if config["freeze_image_encoder"] and config["use_image"]:
-        model.img_encoder.eval()
-
-    val_loss, correct = 0.0, 0
-
-    y_true = []
-    y_score = []  # prob of class 1
-    y_pred = []   # predicted label (0/1)
-
-    for batch in tqdm(loader, desc="Validation"):
-        label = batch["label"].to(device)
-
-        spot_embeds = encode_spots_chunkwise(model, batch, config, device)
-
-        use_amp = config["use_image"]
-        amp_ctx = autocast() if use_amp else nullcontext()
-        with amp_ctx:
-            wsi_embed, _ = model.mil_pooling(spot_embeds)
-            logits = model.classifier(wsi_embed.unsqueeze(0)).squeeze(0)
-            loss = criterion(logits.unsqueeze(0), label.unsqueeze(0))
-
-        val_loss += loss.item()
-        pred = logits.argmax().item()
-        correct += int(pred == label.item())
-
-        # ROC/AUC
-        prob_pos = torch.softmax(logits, dim=0)[1].item()
-        y_true.append(label.item())
-        y_score.append(prob_pos)
-        y_pred.append(pred)
-
-        del spot_embeds, wsi_embed, logits, loss
-        torch.cuda.empty_cache()
-
-    val_loss = val_loss / len(loader)
-    val_acc = 100 * correct / len(loader)
-
-    # AUC
-    auc = float('nan')
-    try:
-      auc = roc_auc_score(y_true, y_score)
-      # fpr, tpr, thresholds = roc_curve(y_true, y_score)
-    except Exception:
-      pass
-
-    # precision/recall/f1 (class 1=positive로)
-    p, r, f1, _ = precision_recall_fscore_support(
-        y_true, y_pred, average="binary", pos_label=1, zero_division=0
-    )
-    p, r, f1 = float(p), float(r), float(f1)
-
-    # confusion matrix: [[TN, FP], [FN, TP]]
-    cm = confusion_matrix(y_true, y_pred, labels = [0, 1])
-
-    return val_loss, val_acc, auc, p, r, f1, cm
-
-# ===============================================
-# Main
-# ===============================================
 def main():
-    CONFIG = load_config("configs/train_ablation.yaml")
-    set_seed(CONFIG["seed"])
-    device = torch.device(CONFIG["device"])
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--root_dir", type=str, required=True)
+    parser.add_argument("--ckpt", type=str, required=True)
+    parser.add_argument("--out_dir", type=str, default="./xai_outputs")
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
 
-    print("="*70)
-    print("MIL Training (Ablation-ready)")
-    print("="*70)
-    for k, v in CONFIG.items():
-        print(f"  {k}: {v}")
-    print("="*70 + "\n")
+    # model params
+    parser.add_argument("--num_genes", type=int, default=2000)
+    parser.add_argument("--num_classes", type=int, default=2)
+    parser.add_argument("--embed_dim", type=int, default=256)
+    parser.add_argument("--fusion_option", type=str, default="concat")
+    parser.add_argument("--top_k_genes", type=int, default=512)
+    parser.add_argument("--freeze_image_encoder", action="store_true")
 
-    train_samples, val_samples = prepare_data_splits(
-        CONFIG["root_dir"], CONFIG["seed"]
+    # 추가: ablation flags
+    parser.add_argument("--use_image", action="store_true", help="Enable image modality")
+    parser.add_argument("--use_st", action="store_true", help="Enable ST modality")
+
+    # data params
+    parser.add_argument("--max_spots", type=int, default=2000)
+    parser.add_argument("--topk_patches", type=int, default=12)
+    parser.add_argument("--topk_genes", type=int, default=30)
+    parser.add_argument("--embed_2d", type=str, default="umap", choices=["umap", "pca"])
+
+    # for local debugging
+    args = parser.parse_args(args=[
+        "--root_dir", r"\src2\hest_data",
+        "--ckpt", r"src2\best_model_img_concat.pt",
+        "--use_image",
+        "--use_st",
+    ])
+
+    # default=multimodal
+    if (not args.use_image) and (not args.use_st):
+        args.use_image = True
+        args.use_st = True
+
+    assert args.use_image or args.use_st, "At least one modality must be enabled"
+
+    if args.use_image and args.use_st:
+        print("Running in MULTIMODAL mode (image + ST)")
+        mode_suffix = "st_img"
+    elif args.use_image and not args.use_st:
+        print("Running in IMAGE-ONLY mode")
+        mode_suffix = "img"
+    elif not args.use_image and args.use_st:
+        print("Running in ST-ONLY mode")
+        mode_suffix = "st"
+    else:
+        raise ValueError("Invalid modality setting")
+    
+    args.out_dir = f"{args.out_dir}_{mode_suffix}"
+    os.makedirs(args.out_dir, exist_ok=True)
+
+    # samples + loader
+    samples = discover_samples(args.root_dir)
+    if len(samples) == 0:
+        raise RuntimeError("No samples discovered. Check root_dir structure.")
+    loader = create_wsi_dataloader(
+        samples,
+        batch_size=1,
+        shuffle=False,
+        max_spots=args.max_spots,
+        root_dir=args.root_dir,
+        return_trace=True,
     )
 
-    train_loader = create_wsi_dataloader(
-        train_samples, 1, True, CONFIG["max_spots"], CONFIG["root_dir"]
-    )
-    val_loader = create_wsi_dataloader(
-        val_samples, 1, False, CONFIG["max_spots"], CONFIG["root_dir"]
-    )
+    # gene order (fallback)
+    global_gene_order = load_global_gene_order(args.root_dir)
+    if global_gene_order is None:
+        global_gene_order = []
 
+    # model
     model = MultiModalMILModel(
-        num_genes=CONFIG["num_genes"],
-        num_classes=CONFIG["num_classes"],
-        embed_dim=CONFIG["embed_dim"],
-        fusion_option=CONFIG["fusion_option"],
-        top_k_genes=CONFIG.get("top_k_genes"),
+        num_genes=args.num_genes,
+        num_classes=args.num_classes,
+        embed_dim=args.embed_dim,
+        fusion_option=args.fusion_option,
+        top_k_genes=args.top_k_genes,
+        freeze_image_encoder=args.freeze_image_encoder,
 
-        # ✅ ablation flags into model
-        use_image=CONFIG["use_image"],
-        use_st=CONFIG["use_st"],
+        # ablation flags into model
+        use_image=args.use_image,
+        use_st=args.use_st,
+    ).to(args.device)
 
-        # keep this behavior consistent
-        freeze_image_encoder=CONFIG["freeze_image_encoder"],
-    ).to(device)
+    ckpt = torch.load(args.ckpt, map_location="cpu")
+    if isinstance(ckpt, dict) and "state_dict" in ckpt:
+        state = ckpt["state_dict"]
+    elif isinstance(ckpt, dict) and "model_state_dict" in ckpt:
+        state = ckpt["model_state_dict"]
+    else:
+        state = ckpt
 
-    optimizer = optim.AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=CONFIG["lr"],
-        weight_decay=CONFIG["weight_decay"]
-    )
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    print("missing sample:", missing[:30])
+    print("unexpected sample:", unexpected[:30])
 
-    criterion = nn.CrossEntropyLoss()
-    scaler = GradScaler() if CONFIG["use_image"] else None
+    print(f"[load] missing keys: {len(missing)}, unexpected keys: {len(unexpected)}")
 
-    best_val_acc = 0.0
+    model.eval()
 
-    # checkpoint name by ablation setting (helpful)
-    tag = ("img" if CONFIG["use_image"] else "") + ("st" if CONFIG["use_st"] else "")
-    tag = tag if tag else "none"
-    ckpt_path = f"best_model_{tag}_{CONFIG['fusion_option']}.pt"
+    with torch.inference_mode():
+        for batch in loader:
+            sample_id = batch["sample_id"]
+            out_dir = os.path.join(args.out_dir, sample_id)
+            os.makedirs(out_dir, exist_ok=True)
 
-    for epoch in range(CONFIG["epochs"]):
-        print(f"\nEpoch {epoch+1}/{CONFIG['epochs']}")
-        train_loss, train_acc = train_epoch(
-            model, train_loader, criterion, optimizer, scaler, CONFIG, device
-        )
-        val_loss, val_acc, val_auc, val_p, val_r, val_f1, cm = validate(
-            model, val_loader, criterion, CONFIG, device
-        )
+            label = int(batch["label"].item())
 
-        print(
-            f"Train Acc: {train_acc:.2f}% | "
-            f"Val Acc: {val_acc:.2f}% | Val AUC: {val_auc:.4f} | "
-            f"P/R/F1: {val_p:.3f}/{val_r:.3f}/{val_f1:.3f}"
-        )
-
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            torch.save(model.state_dict(), ckpt_path)
-
-            # confusion matrix -> best model일 때만 plot
-            plot_confusion_matrix(
-                cm,
-                class_names=("0", "1"),   # Healthy / Cancer면 바꿔도 됨
-                title=f"Val Confusion Matrix (Epoch {epoch+1})",
-                save_path=f"confusion_matrix_epoch_{epoch+1}.png"
-            )
+            print(f"Processing: {sample_id}")
             
-            print(f"✓ Saved best model to: {ckpt_path} (val_acc={val_acc:.2f}%)")
+            # modality별로 필요한 것만 GPU로
+            images = batch["images"].to(args.device) if args.use_image else None
+            expr   = batch["expr"].to(args.device)   if args.use_st else None
+            coords = batch["coords"].to(args.device) if args.use_st else None
 
-    print("\nTRAINING COMPLETE!!")
+            # XAI metadata
+            barcodes = batch.get("barcodes", None)            # list[str]
+            patch_indices = batch.get("patch_indices", None)  # np.ndarray
+            coords_raw = batch.get("coords_raw", None)        # torch.Tensor (N,2)
+            gene_order = batch.get("gene_order", global_gene_order)
 
+            # gene attn - only for ST
+            outputs = model(
+                images,
+                expr,
+                coords,
+                return_gene_attn=bool(args.use_st),
+                return_spot_embeds=True
+            )
+
+            # ---- unpack ----
+            if not isinstance(outputs, dict):
+                raise ValueError("Model must return a dict with keys: logits, mil_attn, spot_embeds, ...")
+
+            logits = outputs.get("logits", None)
+            mil_attn = outputs.get("mil_attn", None)
+            spot_embeds = outputs.get("spot_embeds", None)
+
+            gene_attn = outputs.get("gene_attn", None)
+            gene_indices = outputs.get("gene_indices", None)
+
+            if logits is None:
+                raise ValueError("Model dict output must contain 'logits'.")
+
+            probs = F.softmax(logits, dim=-1).detach().cpu().numpy().tolist()
+            pred = int(np.argmax(probs))
+
+            # n_spots: 
+            if args.use_image:
+                n_spots = int(images.shape[0])
+            else:
+                n_spots = int(expr.shape[0])
+
+            # summary 
+            summary = {
+                "sample_id": sample_id,
+                "gt_label": label,
+                "pred_label": pred,
+                "probs": probs,
+                "num_spots_used": n_spots,
+                "use_image": bool(args.use_image),
+                "use_st": bool(args.use_st),
+                "mil_attn_available": mil_attn is not None,
+                "spot_embeds_available": spot_embeds is not None,
+                "gene_xai_available": (gene_attn is not None and gene_indices is not None),
+            }
+            with open(os.path.join(out_dir, "pred.json"), "w") as f:
+                json.dump(summary, f, indent=2)
+
+            if mil_attn is None:
+                continue
+
+            mil_attn = mil_attn.view(-1)
+
+            # Top-10 important spots
+            top10 = torch.topk(mil_attn, k=min(10, n_spots)).indices.detach().cpu().tolist()
+
+            # UMAP/PCA
+            if spot_embeds is not None:
+                X = spot_embeds.detach().cpu().numpy()
+                Z = compute_2d_embedding(X, method=args.embed_2d, seed=0)
+
+                a = mil_attn.detach().cpu().numpy()
+                a_min, a_max = float(a.min()), float(a.max())
+                denom = (a_max - a_min) if (a_max - a_min) > 1e-12 else 1.0
+                a_n = (a - a_min) / denom
+
+                plt.figure()
+                plt.scatter(Z[:, 0], Z[:, 1], s=10 + 200 * a_n)
+                plt.title(f"{args.embed_2d.upper()} of spot embeddings (size=mil_attn)")
+                plt.xlabel(f"{args.embed_2d.upper()}-1")
+                plt.ylabel(f"{args.embed_2d.upper()}-2")
+                plt.tight_layout()
+                plt.savefig(os.path.join(out_dir, f"spot_embeds_{args.embed_2d}.png"), dpi=200)
+                plt.close()
+
+                plt.figure()
+                plt.scatter(
+                    Z[:, 0], Z[:, 1],
+                    c=a_n,
+                    s=10 + 200 * a_n,
+                    cmap="viridis"
+                )
+                plt.colorbar(label="MIL attention")
+                plt.title(f"{args.embed_2d.upper()} of spot embeddings (color+size=mil_attn)")
+                plt.xlabel(f"{args.embed_2d.upper()}-1")
+                plt.ylabel(f"{args.embed_2d.upper()}-2")
+                plt.tight_layout()
+                plt.savefig(os.path.join(out_dir, f"spot_embeds_{args.embed_2d}_color.png"), dpi=200)
+                plt.close()
+
+            # Top-k patches
+            if args.use_image and images is not None:
+                k = min(args.topk_patches, n_spots)
+                topk = torch.topk(mil_attn, k=k).indices.detach().cpu().tolist()
+
+                patch_dir = os.path.join(out_dir, "top_patches")
+                os.makedirs(patch_dir, exist_ok=True)
+
+                for rank, i in enumerate(topk, start=1):
+                    fn = f"rank{rank:02d}_idx{i}"
+                    if barcodes is not None:
+                        fn += f"_bc{barcodes[i]}"
+                    if patch_indices is not None:
+                        fn += f"_pidx{int(patch_indices[i])}"
+                    fn += ".png"
+                    save_patch_image(images[i], os.path.join(patch_dir, fn))
+
+            if coords_raw is not None:
+                mask70 = make_top_percent_mask(mil_attn, top_percent=0.7, min_points=20)
+
+                plot_attention_scatter(
+                    coords_raw=coords_raw,
+                    attn=mil_attn.detach().cpu(),
+                    top10_idx=top10,
+                    out_path=os.path.join(out_dir, "patch_attn_scatter_top10.png"),
+                    title="Spot importance (MIL attn) Top10",
+                    mask=mask70
+                )
+
+            if args.use_st and (gene_attn is not None) and (gene_indices is not None) and (len(gene_order) > 0):
+                # gene_attn: (N,1,G) or (N,G)
+                if gene_attn.dim() == 3:
+                    gene_attn2 = gene_attn.squeeze(1)
+                else:
+                    gene_attn2 = gene_attn
+
+                top_genes = aggregate_top_genes(
+                    gene_attn=gene_attn2,
+                    gene_indices=gene_indices,
+                    mil_attn=mil_attn.detach().cpu(),
+                    gene_order=gene_order,
+                    topk=args.topk_genes
+                )
+                with open(os.path.join(out_dir, "top_genes.csv"), "w") as f:
+                    f.write("rank,gene,score\n")
+                    for r, (g, sc) in enumerate(top_genes, start=1):
+                        f.write(f"{r},{g},{sc:.6f}\n")
+
+    print(f"Done. Outputs saved to: {args.out_dir}")
 
 if __name__ == "__main__":
-    import gc
-    gc.collect()
-    torch.cuda.empty_cache()
     main()

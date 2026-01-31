@@ -77,20 +77,7 @@ def download_hest(ids_to_query, local_dir, download_all=False):
 # ============================================
 # 1. Sample IDs to download (fixed list)
 # ============================================
-
-"""
-ids_to_query = [
-    'MEND124', 'MEND46', 'MEND63', 'MEND64', 'MEND65', 'MEND66', 'MEND67', 'MEND68',
-    'MEND71', 'MEND77', 'MISC8', 'NCBI342', 'NCBI343', 'NCBI353', 'NCBI357',
-    'NCBI359', 'NCBI360', 'NCBI370', 'NCBI371', 'NCBI372', 'NCBI385', 'NCBI386',
-    'NCBI397', 'NCBI628', 'NCBI629', 'NCBI630', 'NCBI631', 'NCBI632', 'NCBI633',
-    'NCBI634', 'NCBI635', 'NCBI636', 'NCBI637', 'NCBI638', 'NCBI639', 'NCBI640',
-    'NCBI641', 'NCBI716', 'NCBI800', 'SPA11', 'SPA13', 'TENX138', 'TENX19',
-    'TENX30', 'TENX31', 'TENX61', 'TENX73', 'TENX80',
-]
-"""
-
-ids_to_query = ['MEND124', 'SPA11']
+ids_to_query = ['MEND124', 'MEND125', 'MEND126']  # Example sample IDs
 
 print(f"Total samples to download: {len(ids_to_query)}")
 print(f"Sample IDs: {ids_to_query}")
@@ -177,18 +164,17 @@ for fname in tqdm(os.listdir(st_root)):
         sc.pp.highly_variable_genes(adata, n_top_genes=2000)
         adata = adata[:, adata.var['highly_variable']].copy()
         print(f"  - After HVG selection: {adata.n_vars} genes")
-        
-        # ★★★ Save with compatibility-friendly settings (prevent IOSpec errors) ★★★
+    
         output_path = os.path.join(processed_root, fname)
         adata.write_h5ad(
             output_path,
             compression='gzip',  # Widely compatible compression
             compression_opts=9
         )
-        print(f"  ✓ Saved to {output_path}")
+        print(f"  Saved to {output_path}")
         
     except Exception as e:
-        print(f"  ✗ Failed {sample_id}: {e}")
+        print(f"  Failed {sample_id}: {e}")
         failed_samples.append(sample_id)
         continue
 
@@ -209,8 +195,8 @@ else:
 # ============================================
 # 4. Archive (optional)
 # ============================================
-print("\nCreating archive...")
-shutil.make_archive('hest_data_preprocessed', 'zip', LOCAL_DIR)
-print("Archive created: hest_data_preprocessed.zip")
+# print("\nCreating archive...")
+# shutil.make_archive('hest_data_preprocessed', 'zip', LOCAL_DIR)
+# print("Archive created: hest_data_preprocessed.zip")
 
-print("\n✓ All done!")
+print("\nAll done!")

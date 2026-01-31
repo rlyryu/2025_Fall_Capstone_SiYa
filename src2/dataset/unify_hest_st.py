@@ -162,7 +162,7 @@ for fname in tqdm(sorted(os.listdir(temp_root)), desc="Step 3"):
         gene_coverage.append(coverage)
         
         if len(available_genes) == 0:
-            print(f"  ✗ {sample_id}: No common genes!")
+            print(f"  {sample_id}: No common genes!")
             failed_samples.append(sample_id)
             continue
         
@@ -180,11 +180,11 @@ for fname in tqdm(sorted(os.listdir(temp_root)), desc="Step 3"):
         output_path = os.path.join(processed_root, fname)
         adata.write_h5ad(output_path, compression='gzip', compression_opts=9)
         
-        print(f"  ✓ {sample_id}: {adata.n_obs} spots, "
+        print(f"  {sample_id}: {adata.n_obs} spots, "
               f"{adata.n_vars}/{len(global_hvg)} genes ({coverage:.1f}%)")
         
     except Exception as e:
-        print(f"  ✗ Failed {sample_id}: {e}")
+        print(f"  Failed {sample_id}: {e}")
         failed_samples.append(sample_id)
         continue
 
@@ -223,16 +223,17 @@ else:
 hvg_path = os.path.join(LOCAL_DIR, 'global_hvg_genes.txt')
 with open(hvg_path, 'w') as f:
     f.write('\n'.join(global_hvg))
-print(f"\n✓ Global HVG list saved to: {hvg_path}")
+print(f"\n Global HVG list saved to: {hvg_path}")
 
 # Save sample metadata
 metadata_df = pd.DataFrame(sample_metadata)
 metadata_path = os.path.join(LOCAL_DIR, 'sample_metadata.csv')
 metadata_df.to_csv(metadata_path, index=False)
-print(f"✓ Sample metadata saved to: {metadata_path}")
+print(f" Sample metadata saved to: {metadata_path}")
 
 print("\n" + "="*70)
 print("PREPROCESSING COMPLETE!")
 print("="*70)
 print(f"\nProcessed data location: {processed_root}")
 print(f"Number of files: {len([f for f in os.listdir(processed_root) if f.endswith('.h5ad')])}")
+
