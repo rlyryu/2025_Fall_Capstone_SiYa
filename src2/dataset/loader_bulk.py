@@ -19,9 +19,8 @@ def load_global_gene_order(root_dir):
         print(f"✓ Loaded global gene order: {len(global_genes)} genes")
         return global_genes
     else:
-        print("⚠️  global_hvg_genes_unified.txt not found, will infer from first sample")
+        print("global_hvg_genes_unified.txt not found, will infer from first sample")
         return None
-
 
 # -------------------------------------------------------
 # Custom Sample class
@@ -29,11 +28,11 @@ def load_global_gene_order(root_dir):
 class CustomSample:
     def __init__(self, root, sample_id):
         self.sample_id = sample_id
-        self.bulk_path = os.path.join(root, "bulk_preprocessed", f"{sample_id}.h5ad")
+        self.st_path = os.path.join(root, "st_preprocessed_global_hvg", f"{sample_id}.h5ad")
         self.patch_path = os.path.join(root, "patches", f"{sample_id}.h5")
 
-        if not os.path.exists(self.bulk_path):
-            raise FileNotFoundError(f"{self.bulk_path} not found.")
+        if not os.path.exists(self.st_path):
+            raise FileNotFoundError(f"{self.st_path} not found.")
         if not os.path.exists(self.patch_path):
             raise FileNotFoundError(f"{self.patch_path} not found.")
 
@@ -41,7 +40,7 @@ class CustomSample:
 
     def _load_label(self):
         """Extract sample-level label from h5ad obs['disease_state']"""
-        adata = sc.read_h5ad(self.bulk_path, backed="r")
+        adata = sc.read_h5ad(self.st_path, backed="r")
         val = adata.obs["disease_state"].values[0]
         del adata
 
@@ -49,7 +48,6 @@ class CustomSample:
         if pd.isna(val):
             return 0
         return int(val)
-
 
 # -------------------------------------------------------
 # WSI-level Dataset (unified gene order + zero-padding)
@@ -59,8 +57,6 @@ class WSIDataset(Dataset):
     XAI-friendly outputs:
       - images: (N, C, H, W)
       - expr: (N, G)
-      - coords_raw: (N, 2)  # original spatial coords from adata.obsm["spatial"]
-      - coords_norm: (N, 2) # normalized for model input
       - barcodes: list[str] length N (aligned spot/patch barcode)
       - patch_indices: np.ndarray length N  (index into h5["img"] / h5["barcode"])
       - st_indices: np.ndarray length N     (index into adata.obs_names / expr_aligned / coords_raw before filtering)
@@ -75,30 +71,41 @@ class WSIDataset(Dataset):
         # Fallback: infer gene order from the first sample
         if self.global_gene_order is None:
             print("Inferring gene order from first sample...")
-            adata = sc.read_h5ad(samples[0].bulk_path, backed="r")
+            adata = sc.read_h5ad(samples[0].st_path, backed="r")
             self.global_gene_order = adata.var_names.tolist()
             del adata
-            print(f"✓ Using {len(self.global_gene_order)} genes as reference order")
+            print(f"Using {len(self.global_gene_order)} genes as reference order")
 
     def __len__(self):
         return len(self.samples)
 
-    # decode_barcodes() 제거
-
     @staticmethod
-    def _normalize_coords(coords: torch.Tensor) -> torch.Tensor:
-        """Min-max normalize to [0,1] per WSI for model input (keeps coords_raw separately)."""
-        if coords.numel() == 0:
-            return torch.zeros((0, 2), dtype=torch.float32)
+    def _decode_barcodes(raw_bar: np.ndarray):
+        """Robust decoding for h5py barcode datasets."""
+        if raw_bar.ndim == 0:
+            item = raw_bar.item()
+            return [item.decode() if isinstance(item, (bytes, np.bytes_)) else str(item)]
 
-        if coords.shape[0] == 1:
-            return torch.tensor([[0.5, 0.5]], dtype=coords.dtype)
+        if raw_bar.ndim == 1:
+            out = []
+            for b in raw_bar:
+                out.append(b.decode() if isinstance(b, (bytes, np.bytes_)) else str(b))
+            return out
 
-        c_min = coords.min(dim=0, keepdim=True).values
-        c_max = coords.max(dim=0, keepdim=True).values
-        c_range = c_max - c_min
-        c_range[c_range == 0] = 1.0
-        return (coords - c_min) / c_range
+        if raw_bar.ndim == 2:
+            if raw_bar.shape[1] == 1:
+                out = []
+                for i in range(len(raw_bar)):
+                    item = raw_bar[i, 0]
+                    out.append(item.decode() if isinstance(item, (bytes, np.bytes_)) else str(item))
+                return out
+            raw_bar_flat = raw_bar.flatten()
+            out = []
+            for b in raw_bar_flat:
+                out.append(b.decode() if isinstance(b, (bytes, np.bytes_)) else str(b))
+            return out
+
+        raise ValueError(f"Unexpected barcode shape: {raw_bar.shape}")
 
     def __getitem__(self, idx):
         sample = self.samples[idx]
@@ -106,7 +113,7 @@ class WSIDataset(Dataset):
 
         try:
             # 1. Load AnnData
-            adata = sc.read_h5ad(sample.bulk_path, backed="r")
+            adata = sc.read_h5ad(sample.st_path, backed="r")
 
             # Gene mapping
             sample_genes = adata.var_names.tolist()
@@ -118,32 +125,29 @@ class WSIDataset(Dataset):
 
             # Convert sparse -> dense
             if hasattr(X_raw, "toarray"):
-                bulk_expr = X_raw.toarray()
+                full_expr = X_raw.toarray()
             elif hasattr(X_raw, "todense"):
-                bulk_expr = np.array(X_raw.todense())
+                full_expr = np.array(X_raw.todense())
             else:
-                bulk_expr = np.asarray(X_raw)
-                
+                full_expr = np.asarray(X_raw)
+
             # Shape validation
-            if bulk_expr.ndim == 1:
-                bulk_expr = bulk_expr.reshape(1, -1)
+            if full_expr.ndim != 2:
+                raise ValueError(f"Expected 2D array, got shape {full_expr.shape}")
 
-            if bulk_expr.shape[0] != 1:
-                raise ValueError(f"Expected bulk n_obs=1, got {bulk_expr.shape}")
-
-            n_spots = bulk_expr.shape[0]
+            n_spots = full_expr.shape[0]
 
             # Zero-padded aligned expression matrix
-            expr_aligned = np.zeros((1, len(self.global_gene_order)), dtype=np.float32)
+            expr_aligned = np.zeros((n_spots, len(self.global_gene_order)), dtype=np.float32)
             for new_idx, gene in enumerate(self.global_gene_order):
                 if gene in sample_gene_set:
                     old_idx = gene_to_idx[gene]
-                    expr_aligned[:, new_idx] = bulk_expr[:, old_idx]
-            # barcodes_st = adata.obs_names.to_numpy()
-            # coords_raw_np = np.array(adata.obsm["spatial"])  # bulk -> coord 제거
+                    expr_aligned[:, new_idx] = full_expr[:, old_idx]
+
+            barcodes_st = adata.obs_names.to_numpy()
             label_val = sample.label
 
-            del bulk_expr, X_raw
+            del full_expr, X_raw
             # keep adata until we finish extracting all needed
             del adata
             adata = None
@@ -154,32 +158,57 @@ class WSIDataset(Dataset):
             # -------------------------
             with h5py.File(sample.patch_path, "r") as f:
                 imgs = f["img"][:]         # (n_patches, H, W, C)
-                # raw_bar = np.array(f["barcode"])
+                raw_bar = np.array(f["barcode"])
 
-            n_patches = imgs.shape[0]
+            patch_barcodes = self._decode_barcodes(raw_bar)
+            if len(patch_barcodes) == 0:
+                raise ValueError("No patch barcodes found")
 
-            sel = np.arange(len(imgs), dtype=np.int64)
-            if self.max_spots and len(imgs) > self.max_spots:
-                sel = np.random.choice(len(imgs), self.max_spots, replace=False).astype(np.int64)
-            
-            images_np = imgs[sel]
-            N = images_np.shape[0]
-            expr_np = np.repeat(expr_aligned, repeats=N, axis=0).astype(np.float32)
-            
+            b2i = {b: i for i, b in enumerate(patch_barcodes)}
+
+            # -------------------------
+            # 3) Align ST spots <-> patches by barcode
+            # -------------------------
+            patch_idx = []
+            st_idx = []
+            aligned_barcodes = []
+
+            for i, b in enumerate(barcodes_st):
+                if b in b2i:
+                    patch_idx.append(b2i[b])
+                    st_idx.append(i)
+                    aligned_barcodes.append(str(b))
+
+            if len(patch_idx) == 0:
+                raise ValueError("No aligned spots")
+
+            patch_idx = np.asarray(patch_idx, dtype=np.int64)
+            st_idx = np.asarray(st_idx, dtype=np.int64)
+
+            images_np = imgs[patch_idx]                # (N, H, W, C)
+            expr_np = expr_aligned[st_idx]             # (N, G)
+            expr_wsi = expr_np.mean(axis=0).astype(np.float32)  # (G,)
+
+            # -------------------------
+            # 4) Spot sampling (keep trace) -> bulk용 수정: sampling only for images 
+            # -------------------------
+            sel = np.arange(len(images_np), dtype=np.int64)
+            if self.max_spots and len(images_np) > self.max_spots:
+                sel = np.random.choice(len(images_np), self.max_spots, replace=False).astype(np.int64)
+                images_np = images_np[sel]
+                patch_idx = patch_idx[sel]
+                st_idx = st_idx[sel]
+                aligned_barcodes = [aligned_barcodes[i] for i in sel.tolist()]
+
+            # -------------------------
+            # 5) Tensor conversion
+            # -------------------------
             images = torch.from_numpy(images_np).permute(0, 3, 1, 2).float() / 255.0
-            expr = torch.from_numpy(expr_np).float()
-
-            coords_raw_aligned_np = np.full((N, 2), 0.5, dtype=np.float32)  # bulk -> dummy coord
-            
-            coords_raw = torch.from_numpy(coords_raw_aligned_np).float()
-            coords_norm = coords_raw
+            expr = torch.from_numpy(expr_wsi).float()
 
             out = {
                 "images": images,
                 "expr": expr,
-                "coords": coords_norm,          # backward compatibility (your model input)
-                "coords_norm": coords_norm,     # explicit
-                "coords_raw": coords_raw,       # for visualization on original layout
                 "label": torch.tensor(label_val).long(),
                 "sample_id": sample.sample_id,
                 "num_spots": int(images.shape[0]),
@@ -187,16 +216,16 @@ class WSIDataset(Dataset):
 
             if self.return_trace:
                 out.update({
-                    # "barcodes": aligned_barcodes,         # list[str], length N
-                    "patch_indices": sel,           # np.ndarray length N
-                    # "st_indices": st_idx,                 # np.ndarray length N
+                    "barcodes": aligned_barcodes,         # list[str], length N
+                    "patch_indices": patch_idx,           # np.ndarray length N
+                    "st_indices": st_idx,                 # np.ndarray length N
                     "sel_indices": sel,                   # np.ndarray length N (after sampling)
                 })
 
             return out
 
         except Exception as e:
-            print(f"⚠️ Error loading {sample.sample_id}: {e}")
+            print(f"Error loading {sample.sample_id}: {e}")
             import traceback
             print(traceback.format_exc())
             raise
@@ -246,7 +275,7 @@ def get_gene_info(samples):
     """Retrieve gene information from the first sample"""
     sample = samples[0]
 
-    adata = sc.read_h5ad(sample.bulk_path, backed="r")
+    adata = sc.read_h5ad(sample.st_path, backed="r")
     num_genes = adata.n_vars
     gene_names = adata.var_names.tolist()
     del adata
@@ -273,15 +302,12 @@ def validate_dataloader(loader, num_batches=5):
         print(f"  Sample ID: {batch['sample_id']}")
         print(f"  Images shape: {batch['images'].shape}")
         print(f"  Expression shape: {batch['expr'].shape}")
-        print(f"  Coords(norm) shape: {batch['coords'].shape}")
-        print(f"  Coords(raw) shape: {batch['coords_raw'].shape}")
         print(f"  Label: {batch['label'].item()}")
         print(f"  Num spots: {batch['num_spots']}")
 
         # Range checks
         print(f"  Image range: [{batch['images'].min():.3f}, {batch['images'].max():.3f}]")
         print(f"  Expr range: [{batch['expr'].min():.3f}, {batch['expr'].max():.3f}]")
-        print(f"  Coord(norm) range: [{batch['coords'].min():.3f}, {batch['coords'].max():.3f}]")
 
         # Zero-padding check
         nonzero_genes = (batch["expr"].sum(dim=0) != 0).sum()
@@ -289,9 +315,6 @@ def validate_dataloader(loader, num_batches=5):
 
         # Trace availability
         if "patch_indices" in batch:
-            msg = f"Trace keys: patch_indices({len(batch['patch_indices'])})"
-            if "st_indices" in batch: msg += f", st_indices({len(batch['st_indices'])})"
-            if "barcodes" in batch: msg += f", barcodes({len(batch['barcodes'])})"
-            print(msg)
+            print(f"  Trace keys: patch_indices({len(batch['patch_indices'])}), st_indices({len(batch['st_indices'])}), barcodes({len(batch['barcodes'])})")
 
-    print("\n✓ Validation complete")
+    print("\nValidation complete")

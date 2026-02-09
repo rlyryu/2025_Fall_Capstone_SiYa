@@ -1,25 +1,8 @@
-# train_bulk.py
-# -------------------------------------------------------
-# Minimal-modification bulk-RNAseq training script
-# - Keeps your existing WSI patch pipeline + MIL
-# - Replaces ST expr/coords with per-sample bulk expression
-# - Bulk is injected per chunk (no giant (N_spots,K) allocation)
-#
-# Expected bulk file location (choose ONE and place files accordingly):
-#   1) {root_dir}/bulk_expr/{sample_id}.npy   (shape: (K,))
-#   2) {root_dir}/bulk_expr/{sample_id}.pt    (torch tensor shape: (K,))
-#   3) {root_dir}/bulk_expr/{sample_id}.csv   (either "gene,expr" or single-row numeric)
-#
-# Notes:
-# - coords are dummy zeros (no true spatial meaning in bulk)
-# - st_encoder is reused as-is; spatial token exists but coords are zeros
-# -------------------------------------------------------
-
 import warnings
 warnings.filterwarnings('ignore')
 
 from sklearn.metrics import (
-    roc_auc_score,
+    roc_auc_score, roc_curve,
     precision_recall_fscore_support,
     confusion_matrix
 )
@@ -34,6 +17,7 @@ import torch.optim as optim
 from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
 from sklearn.model_selection import train_test_split
+from contextlib import nullcontext
 
 from dataset.loader_bulk import CustomSample, create_wsi_dataloader
 from models.model_bulk import MultiModalMILModel
@@ -42,31 +26,25 @@ from models.model_bulk import MultiModalMILModel
 # ===============================================
 # YAML Config Loader
 # ===============================================
-def load_config(path="configs/train_bulk.yaml"):
-    """
-    Minimal changes vs train.yaml:
-    - add cfg["data"]["bulk_dir"] (default: "{root_dir}/bulk_expr")
-    - optionally add cfg["data"]["bulk_ext"] in {npy, pt, csv} (default: auto)
-    """
+def load_config(path="configs/train_ablation.yaml"):
     with open(path, "r") as f:
         cfg = yaml.safe_load(f)
 
-    root_dir = cfg["data"]["root_dir"]
-    bulk_dir = cfg["data"].get("bulk_dir", os.path.join(root_dir, "bulk_processed"))
-
     CONFIG = {
         # Data
-        "root_dir": root_dir,
+        "root_dir": cfg["data"]["root_dir"],
         "max_spots": cfg["data"]["max_spots"],
-        "bulk_dir": bulk_dir,
-        "bulk_ext": cfg["data"].get("bulk_ext", "auto"),  # "auto" | "npy" | "pt" | "csv"
 
         # Model
         "num_genes": cfg["model"]["num_genes"],
         "num_classes": cfg["model"]["num_classes"],
         "embed_dim": cfg["model"]["embed_dim"],
-        "fusion_option": cfg["model"]["fusion_option"],
+        "fusion_option": cfg["model"].get("fusion_option", "concat"),
         "top_k_genes": cfg["model"].get("top_k_genes"),
+
+        # ✅ Ablation flags (default: multimodal)
+        "use_image": cfg["model"].get("use_image", True),
+        "use_st": cfg["model"].get("use_st", True),
 
         # Training
         "epochs": cfg["training"]["epochs"],
@@ -84,6 +62,8 @@ def load_config(path="configs/train_bulk.yaml"):
         "seed": cfg["misc"]["seed"],
         "checkpoint_freq": cfg["misc"]["checkpoint_freq"],
     }
+
+    assert CONFIG["use_image"] or CONFIG["use_st"], "At least one modality must be enabled"
     return CONFIG
 
 
@@ -93,18 +73,22 @@ def load_config(path="configs/train_bulk.yaml"):
 def set_seed(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+    import numpy as np
     np.random.seed(seed)
 
-
 def plot_confusion_matrix(
-    cm,
-    class_names=('0', '1'),
-    title="Confusion Matrix",
-    save_path=None
+  cm, 
+  class_names=('0', '1'),
+  title="Confusion Matrix",
+  save_path = None
 ):
+    """
+    cm: np.array shape (2, 2) [[TN, FP]. [FN, TP]]
+    """
     fig, ax = plt.subplots(figsize=(4, 4))
     im = ax.imshow(cm)
 
+    # ticks / labels
     ax.set_xticks(np.arange(len(class_names)))
     ax.set_yticks(np.arange(len(class_names)))
     ax.set_xticklabels(class_names)
@@ -114,124 +98,45 @@ def plot_confusion_matrix(
     ax.set_ylabel("True label")
     ax.set_title(title)
 
+    # 숫자 표시
     for i in range(cm.shape[0]):
         for j in range(cm.shape[1]):
-            ax.text(j, i, cm[i, j], ha="center", va="center", fontsize=12)
-
+            ax.text(
+                j, i, cm[i, j],
+                ha="center", va="center",
+                fontsize=12
+            )
+    
     fig.tight_layout()
+
     if save_path is not None:
         plt.savefig(save_path, dpi=200)
         plt.close(fig)
     else:
         plt.show()
 
-
-def _find_bulk_path(bulk_dir: str, sample_id: str, bulk_ext: str):
-    """
-    Returns a file path for the sample_id, or None if not found.
-    """
-    if bulk_ext != "auto":
-        cand = os.path.join(bulk_dir, f"{sample_id}.{bulk_ext}")
-        return cand if os.path.exists(cand) else None
-
-    ext = "h5ad"
-    cand = os.path.join(bulk_dir, f"{sample_id}.{ext}")
-    if os.path.exists(cand):
-        return cand
-    return None
-
-def load_bulk_expr_vector(bulk_dir: str, sample_id: str, num_genes: int, bulk_ext: str = "auto") -> torch.Tensor:
-    """
-    Loads bulk expression vector for one sample_id.
-    Returns: torch.FloatTensor shape (num_genes,)
-    """
-    path = _find_bulk_path(bulk_dir, sample_id, bulk_ext)
-    if path is None:
-        raise FileNotFoundError(f"Bulk expr not found for {sample_id} in {bulk_dir} (ext={bulk_ext})")
-
-    if path.endswith(".h5ad"):
-        import scanpy as sc
-        adata = sc.read_h5ad(path)
-
-        # expr 벡터 만들기: (K,)
-        X = adata.X
-        if hasattr(X, "toarray"):   # sparse
-            X = X.toarray()
-
-        X = np.asarray(X, dtype=np.float32)
-
-        # 흔한 케이스들 처리:
-        # 1) (1, K): 이미 bulk 1개 샘플
-        if X.ndim == 2 and X.shape[0] == 1:
-            x = X[0]
-        # 2) (N_cells, K): pseudo-bulk면 sum/mean으로 collapse
-        elif X.ndim == 2 and X.shape[0] > 1:
-            # 보통 bulk면 sum 또는 mean 둘 다 가능. "표현량"이면 sum이 더 자연스럽고,
-            # normalize된 값이면 mean이 더 안전. 여기선 mean을 기본으로.
-            x = X.mean(axis=0)
-        else:
-            raise ValueError(f"Unexpected adata.X shape for bulk h5ad: {X.shape}")
-
-        x = np.asarray(x, dtype=np.float32).reshape(-1)
-    else:
-        raise ValueError(f"Unsupported bulk file: {path}")
-
-    if x.shape[0] != num_genes:
-        raise ValueError(f"Bulk vector length mismatch for {sample_id}: got {x.shape[0]}, expected {num_genes}")
-
-    return torch.from_numpy(x)  # (K,)
-
-
 # ===============================================
 # Data Split
 # ===============================================
-def prepare_data_splits(root_dir, bulk_dir, num_genes, bulk_ext="auto", seed=42):
-    """
-    Minimal change:
-    - Valid sample = has patches + has bulk expr file
-    - ST dir existence is not required for bulk training (but your CustomSample may require it).
-      If your CustomSample currently requires .h5ad, keep st_dir check as well.
-    """
-
-    # Keep your original intersection logic so CustomSample keeps working.
-    # If you later remove ST dependency from CustomSample, you can drop st_dir part.
+def prepare_data_splits(root_dir, seed=42):
     st_dir = os.path.join(root_dir, "st_preprocessed_global_hvg")
     patch_dir = os.path.join(root_dir, "patches")
 
     st_files = {f.replace('.h5ad', '') for f in os.listdir(st_dir) if f.endswith('.h5ad')}
     patch_files = {f.replace('.h5', '') for f in os.listdir(patch_dir) if f.endswith('.h5')}
-    candidate_ids = sorted(st_files & patch_files)
+    valid_ids = sorted(st_files & patch_files)
 
-    print("[DEBUG] st_dir:", st_dir, "exists:", os.path.isdir(st_dir))
-    print("[DEBUG] patch_dir:", patch_dir, "exists:", os.path.isdir(patch_dir))
-    print("[DEBUG] bulk_dir:", bulk_dir, "exists:", os.path.isdir(bulk_dir))
-
-    print("[DEBUG] st files:", len(st_files), "patch files:", len(patch_files), "candidate:", len(candidate_ids))
-    if len(candidate_ids) > 0:
-        sid = candidate_ids[0]
-        print("[DEBUG] example sid:", sid, "bulk path:", _find_bulk_path(bulk_dir, sid, bulk_ext))
-
-    # filter by bulk existence
-    valid_ids = []
-    for sid in candidate_ids:
-        if _find_bulk_path(bulk_dir, sid, bulk_ext) is not None:
-            valid_ids.append(sid)
-
-    print(f"Found {len(valid_ids)} valid samples (patch + ST + bulk)")
+    print(f"Found {len(valid_ids)} valid samples")
 
     samples, labels = [], []
     for sid in valid_ids:
         try:
             sample = CustomSample(root_dir, sid)
-            # Ensure bulk vector is loadable (catch early)
-            _ = load_bulk_expr_vector(bulk_dir, sid, num_genes=num_genes, bulk_ext=bulk_ext)
-
             if sample.label in [0, 1]:
                 samples.append(sample)
                 labels.append(sample.label)
             else:
                 print(f"⚠️  Skipping {sid} (label={sample.label})")
-
         except Exception as e:
             print(f"Failed to load {sid}: {e}")
 
@@ -247,17 +152,106 @@ def prepare_data_splits(root_dir, bulk_dir, num_genes, bulk_ext="auto", seed=42)
         stratify=labels,
         random_state=seed
     )
+    
+    # data leakage 체크
+    train_ids = {s.sample_id for s in train_samples}
+    val_ids   = {s.sample_id for s in val_samples}
+    inter = train_ids & val_ids
+    print("Overlap train/val:", len(inter))
+    if len(inter) > 0:
+        print("Examples:", list(sorted(inter))[:10])
 
     print(f"\nSplit: {len(train_samples)} train, {len(val_samples)} val")
     return train_samples, val_samples
 
 
 # ===============================================
+# Bulk encoding helper (chunk-wise, ablation-aware)
+# ===============================================
+def forward_bulk_early_fusion_chunkwise(model, batch, config, device):
+    """
+    Returns:
+      logits: (num_classes,)
+      mil_attn: (N_spots,) or None
+      gene_attn, gene_indices: optional (bulk)
+    """
+    use_image = config["use_image"]
+    use_st = config["use_st"]
+    freeze_img = config["freeze_image_encoder"]
+
+    images = batch["images"] if use_image else None          # (N,3,224,224)
+    expr_wsi = batch["expr"] if use_st else None             # (K,)
+
+    if use_st:
+        # make sure expr_wsi is (K,)
+        if expr_wsi.dim() == 2 and expr_wsi.size(0) == 1:
+            expr_wsi = expr_wsi.squeeze(0)
+            
+    # bulk ST branch
+    gene_attn = gene_indices = None
+    if use_st:
+        expr_wsi = expr_wsi.to(device)
+        if "return_gene_attn" in model.st_encoder.forward.__code__.co_varnames:
+            st_wsi = model.st_encoder(expr_wsi, return_gene_attn=False)  # training: False
+        else:
+            st_wsi = model.st_encoder(expr_wsi)
+    else:
+        st_wsi = None
+
+    # image branch: chunkwise encode spots -> MIL
+    if use_image:
+        N = images.size(0)
+        spot_list = []
+
+        use_amp = True
+        amp_ctx = autocast() if use_amp else nullcontext()
+
+        for i in range(0, N, config["batch_spots"]):
+            j = min(i + config["batch_spots"], N)
+            img_b = images[i:j].to(device)
+
+            with amp_ctx:
+                if freeze_img:
+                    with torch.no_grad():
+                        img_feat = model.img_encoder(img_b)
+                else:
+                    img_feat = model.img_encoder(img_b)
+                img_feat = model.img_head(img_feat)
+
+            spot_list.append(img_feat)
+            del img_b, img_feat
+            torch.cuda.empty_cache()
+
+        spot_embeds = torch.cat(spot_list, dim=0)  # (N,D)
+
+        with amp_ctx:
+            img_wsi, mil_attn = model.mil_pooling(spot_embeds)
+            mil_attn = mil_attn.squeeze(-1)  # (N,)
+        del spot_embeds
+    else:
+        img_wsi, mil_attn = None, None
+
+    # WSI-level early fusion & classifier
+    use_amp = True
+    amp_ctx = autocast() if use_amp else nullcontext()
+    with amp_ctx:
+        if use_image and use_st:
+            wsi_embed = model.wsi_fusion(img_wsi, st_wsi)
+        elif use_image:
+            wsi_embed = img_wsi
+        else:
+            wsi_embed = st_wsi
+
+        logits = model.classifier(wsi_embed)
+
+    return logits, mil_attn
+
+# ===============================================
 # Training / Validation
 # ===============================================
 def train_epoch(model, loader, criterion, optimizer, scaler, config, device):
     model.train()
-    if config["freeze_image_encoder"]:
+    if config["freeze_image_encoder"] and config["use_image"]:
         model.img_encoder.eval()
 
     epoch_loss, correct = 0.0, 0
@@ -265,59 +259,35 @@ def train_epoch(model, loader, criterion, optimizer, scaler, config, device):
 
     loop = tqdm(loader, desc="Training")
 
+    # use_amp = config["use_image"]
+    use_amp = True
+    amp_ctx = autocast() if use_amp else nullcontext()
+
     for step, batch in enumerate(loop):
-        images = batch["images"]          # (N_spots, 3, 224, 224) on CPU
-        label = batch["label"].to(device) # scalar
-        sample_id = batch.get("sample_id", None)
-        if sample_id is None:
-            raise KeyError("Loader must provide batch['sample_id'] for bulk lookup.")
-        if isinstance(sample_id, (list, tuple)):
-            # In case loader returns list; batch_size=1 so take [0]
-            sample_id = sample_id[0]
-
-        # Load bulk vector once per sample
-        bulk_vec = load_bulk_expr_vector(
-            bulk_dir=config["bulk_dir"],
-            sample_id=sample_id,
-            num_genes=config["num_genes"],
-            bulk_ext=config["bulk_ext"],
-        ).to(device)  # (K,)
-
-        N = images.size(0)
-        spot_img_list = []
-
-        for i in range(0, N, config["batch_spots"]):
-            j = min(i + config["batch_spots"], N)
-            img_b = images[i:j].to(device)
-            with autocast():
-                if config["freeze_image_encoder"]:
-                    with torch.no_grad():
-                        img_feat = model.img_encoder(img_b)
-                else:
-                    img_feat = model.img_encoder(img_b)
-                img_feat = model.img_head(img_feat)
-                
-
-            spot_img_list.append(img_feat.detach().cpu())
-
-        torch.cuda.empty_cache()
-
-        img_feat_all = torch.cat(spot_img_list, dim=0).to(device)
-
-        with autocast():
-            outputs = model(img_feat_all, bulk_vec, return_gene_attn=False, return_spot_embeds=False)
-            logits = outputs["logits"]
+        label = batch["label"].to(device)
+        
+        with amp_ctx:
+            logits, _ = forward_bulk_early_fusion_chunkwise(model, batch, config, device)
             loss = criterion(logits.unsqueeze(0), label.unsqueeze(0))
             loss = loss / config["accum_steps"]
-        scaler.scale(loss).backward()
+
+        if use_amp:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
 
         if (step + 1) % config["accum_steps"] == 0:
-            scaler.unscale_(optimizer)
+            if use_amp:
+                scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(
                 filter(lambda p: p.requires_grad, model.parameters()), 1.0
             )
-            scaler.step(optimizer)
-            scaler.update()
+
+            if use_amp:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
             optimizer.zero_grad()
 
         epoch_loss += loss.item() * config["accum_steps"]
@@ -328,114 +298,100 @@ def train_epoch(model, loader, criterion, optimizer, scaler, config, device):
             acc=f"{100*correct/(step+1):.1f}%"
         )
 
-        del img_feat_all, outputs, logits, loss, bulk_vec, spot_img_list
-    torch.cuda.empty_cache()
-
+        del logits, loss
+        torch.cuda.empty_cache()
+        
+    # after loop ends: flush remaining grads once
+    if (step + 1) % config["accum_steps"] != 0:
+        if use_amp:
+            scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(
+            filter(lambda p: p.requires_grad, model.parameters()), 1.0
+        )
+        if use_amp:
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
+        optimizer.zero_grad()
+        
     return epoch_loss / len(loader), 100 * correct / len(loader)
 
 
 @torch.no_grad()
 def validate(model, loader, criterion, config, device):
     model.eval()
+    if config["freeze_image_encoder"] and config["use_image"]:
+        model.img_encoder.eval()
+
     val_loss, correct = 0.0, 0
 
     y_true = []
-    y_score = []
-    y_pred = []
+    y_score = []  # prob of class 1
+    y_pred = []   # predicted label (0/1)
 
     for batch in tqdm(loader, desc="Validation"):
-        images = batch["images"]
         label = batch["label"].to(device)
-        sample_id = batch.get("sample_id", None)
-        if sample_id is None:
-            raise KeyError("Loader must provide batch['sample_id'] for bulk lookup.")
-        if isinstance(sample_id, (list, tuple)):
-            sample_id = sample_id[0]
 
-        bulk_vec = load_bulk_expr_vector(
-            bulk_dir=config["bulk_dir"],
-            sample_id=sample_id,
-            num_genes=config["num_genes"],
-            bulk_ext=config["bulk_ext"],
-        ).to(device)  # (K,)
-
-        N = images.size(0)
-        spot_img_list = []
-
-        for i in range(0, N, config["batch_spots"]):
-            j = min(i + config["batch_spots"], N)
-            img_b = images[i:j].to(device)
-            
-            with autocast():
-                if config["freeze_image_encoder"]:
-                    with torch.no_grad():
-                        img_feat = model.img_encoder(img_b)
-                else:
-                    img_feat = model.img_encoder(img_b)
-
-                img_feat = model.img_head(img_feat)
-
-            spot_img_list.append(img_feat.detach().cpu())
-
-        img_feat_all = torch.cat(spot_img_list, dim=0).to(device)
-
-        with autocast():
-            outputs = model(img_feat_all, bulk_vec, return_gene_attn=False, return_spot_embeds=False)
-            logits = outputs["logits"]
+        # use_amp = config["use_image"]
+        use_amp = True
+        amp_ctx = autocast() if use_amp else nullcontext()
+        with amp_ctx:
+            logits, _ = forward_bulk_early_fusion_chunkwise(model, batch, config, device)
             loss = criterion(logits.unsqueeze(0), label.unsqueeze(0))
 
         val_loss += loss.item()
         pred = logits.argmax().item()
         correct += int(pred == label.item())
 
+        # ROC/AUC
         prob_pos = torch.softmax(logits, dim=0)[1].item()
         y_true.append(label.item())
         y_score.append(prob_pos)
         y_pred.append(pred)
 
-        del bulk_vec, img_feat_all, outputs, logits, loss, spot_img_list
-    torch.cuda.empty_cache()
+        del logits, loss
+        torch.cuda.empty_cache()
 
     val_loss = val_loss / len(loader)
     val_acc = 100 * correct / len(loader)
 
+    # AUC
     auc = float('nan')
     try:
-        auc = roc_auc_score(y_true, y_score)
+      auc = roc_auc_score(y_true, y_score)
+      # fpr, tpr, thresholds = roc_curve(y_true, y_score)
     except Exception:
-        pass
+      pass
 
+    # precision/recall/f1 (class 1=positive로)
     p, r, f1, _ = precision_recall_fscore_support(
         y_true, y_pred, average="binary", pos_label=1, zero_division=0
     )
     p, r, f1 = float(p), float(r), float(f1)
 
-    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
-    return val_loss, val_acc, auc, p, r, f1, cm
+    # confusion matrix: [[TN, FP], [FN, TP]]
+    cm = confusion_matrix(y_true, y_pred, labels = [0, 1])
 
+    return val_loss, val_acc, auc, p, r, f1, cm
 
 # ===============================================
 # Main
 # ===============================================
 def main():
-    CONFIG = load_config("configs/train_bulk.yaml")
+    CONFIG = load_config("configs/train_ablation.yaml")
     set_seed(CONFIG["seed"])
     device = torch.device(CONFIG["device"])
 
-    print("=" * 70)
-    print("WSI + Bulk RNA-seq MIL Training")
-    print("=" * 70)
+    print("="*70)
+    print("MIL Training (Ablation-ready)")
+    print("="*70)
     for k, v in CONFIG.items():
         print(f"  {k}: {v}")
-    print("=" * 70 + "\n")
+    print("="*70 + "\n")
 
-    # data split (now includes bulk existence check)
     train_samples, val_samples = prepare_data_splits(
-        root_dir=CONFIG["root_dir"],
-        bulk_dir=CONFIG["bulk_dir"],
-        num_genes=CONFIG["num_genes"],
-        bulk_ext=CONFIG["bulk_ext"],
-        seed=CONFIG["seed"],
+        CONFIG["root_dir"], CONFIG["seed"]
     )
 
     train_loader = create_wsi_dataloader(
@@ -445,19 +401,20 @@ def main():
         val_samples, 1, False, CONFIG["max_spots"], CONFIG["root_dir"]
     )
 
-    # model: keep your original multimodal architecture
     model = MultiModalMILModel(
         num_genes=CONFIG["num_genes"],
         num_classes=CONFIG["num_classes"],
         embed_dim=CONFIG["embed_dim"],
         fusion_option=CONFIG["fusion_option"],
         top_k_genes=CONFIG.get("top_k_genes"),
-    ).to(device)
 
-    if CONFIG["freeze_image_encoder"]:
-        for p in model.img_encoder.parameters():
-            p.requires_grad = False
-        model.img_encoder.eval()
+        # ✅ ablation flags into model
+        use_image=CONFIG["use_image"],
+        use_st=CONFIG["use_st"],
+
+        # keep this behavior consistent
+        freeze_image_encoder=CONFIG["freeze_image_encoder"],
+    ).to(device)
 
     optimizer = optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
@@ -470,8 +427,13 @@ def main():
 
     best_val_acc = 0.0
 
+    # checkpoint name by ablation setting (helpful)
+    tag = ("img" if CONFIG["use_image"] else "") + ("st" if CONFIG["use_st"] else "")
+    tag = tag if tag else "none"
+    ckpt_path = f"best_model_{tag}_{CONFIG['fusion_option']}.pt"
+
     for epoch in range(CONFIG["epochs"]):
-        print(f"\nEpoch {epoch + 1}/{CONFIG['epochs']}")
+        print(f"\nEpoch {epoch+1}/{CONFIG['epochs']}")
         train_loss, train_acc = train_epoch(
             model, train_loader, criterion, optimizer, scaler, CONFIG, device
         )
@@ -487,14 +449,17 @@ def main():
 
         if val_acc > best_val_acc:
             best_val_acc = val_acc
-            torch.save(model.state_dict(), "best_model_bulk.pt")
+            torch.save(model.state_dict(), ckpt_path)
 
+            # confusion matrix -> best model일 때만 plot
             plot_confusion_matrix(
                 cm,
-                class_names=("0", "1"),
-                title=f"Val Confusion Matrix (Epoch {epoch + 1})",
-                save_path=f"confusion_matrix_bulk_epoch_{epoch + 1}.png"
+                class_names=("0", "1"),   # Healthy / Cancer면 바꿔도 됨
+                title=f"Val Confusion Matrix (Epoch {epoch+1})",
+                save_path=f"confusion_matrix_epoch_{epoch+1}.png"
             )
+            
+            print(f"✓ Saved best model to: {ckpt_path} (val_acc={val_acc:.2f}%)")
 
     print("\nTRAINING COMPLETE!!")
 

@@ -3,7 +3,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.models as models
 from models.performer_pytorch import Performer
-import numpy as np
+
+"""
+An ablation-support ver. of model.py:
+- ST-only
+- Image-only
+- Multimodal(ST+Image)
+"""
 
 # =======================================================
 # 1. Image Encoder (Patch → Spot-level visual feature)
@@ -21,12 +27,10 @@ class ImageEncoder(nn.Module):
         """
         return self.backbone(x)
 
-
 # =======================================================
 # 2. Spatial ST Encoder (HVG-only, scBERT-style)
-#   bulk용: [SPATIAL] -> [CLS]
 # =======================================================
-class BulkRNAEncoder(nn.Module):
+class SpatialSTEncoder(nn.Module):
     """
     scBERT-style encoder with explicit spatial token
 
@@ -65,8 +69,12 @@ class BulkRNAEncoder(nn.Module):
             nn.GELU()
         )
 
-        # Spatial token embedding -> CLS token
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        # Spatial token embedding
+        self.spatial_embedding = nn.Sequential(
+            nn.Linear(2, embed_dim),
+            nn.LayerNorm(embed_dim),
+            nn.GELU()
+        )
 
         # Performer (efficient transformer)
         self.transformer = Performer(
@@ -86,16 +94,25 @@ class BulkRNAEncoder(nn.Module):
         self.v_proj = nn.Linear(embed_dim, embed_dim)
         self.out_proj = nn.Linear(embed_dim, embed_dim)
 
-    def forward(self, expr, return_gene_attn=False):
+    def forward(self, expr, coords, return_gene_attn=False):
         """
-        Bulk -> coord 제거
+        expr   : (N, K)
+        coords : (N, 2)
+
+        if return_gene_attn:
+          returns:
+            pooled: (N, D)
+            gene_attn: (N, G_used)          # G_used = top_k_genes or K
+            gene_indices: (N, G_used) (long) # global gene ids
+        else:
+          returns:
+            pooled: (N, D)
         """
         N, K = expr.shape
         device = expr.device
 
-        # ✅ Top-K gene selection (메모리 절약)
+        # Top-K gene selection
         if self.top_k_genes and self.top_k_genes < K:
-            # 각 spot에서 expression 값이 높은 상위 K개만 선택
             topk_values, topk_indices = torch.topk(expr, k=self.top_k_genes, dim=1)
             gene_indices = topk_indices.long()  # global gene ids
 
@@ -104,22 +121,21 @@ class BulkRNAEncoder(nn.Module):
             value_emb = self.value_embedding(topk_values.unsqueeze(-1))
             gene_tokens = gene_embed + gene_pos + value_emb
         else:
-            # 원래 방식: 모든 gene 사용
-            gene_indices = torch.arange(K, device=device).unsqueeze(0).expand(N, -1).long()
-            gene_embed = self.gene_embedding(gene_indices)
-            gene_pos = self.gene_pos_embedding(gene_indices)
+            gene_ids = torch.arange(K, device=device).unsqueeze(0).expand(N, -1).long()
+            gene_embed = self.gene_embedding(gene_ids)
+            gene_pos = self.gene_pos_embedding(gene_ids)
             value_emb = self.value_embedding(expr.unsqueeze(-1))
             gene_tokens = gene_embed + gene_pos + value_emb
 
-        cls = self.cls_token.expand(N, -1, -1)   # (N,1,D)
-        tokens = torch.cat([cls, gene_tokens], dim=1)
+        spatial_token = self.spatial_embedding(coords).unsqueeze(1)
+        tokens = torch.cat([spatial_token, gene_tokens], dim=1)
 
         tokens = self.transformer(tokens)
 
-        cls_out = tokens[:, :1]
+        spatial_out = tokens[:, :1]
         gene_out    = tokens[:, 1:]
 
-        q = self.q_proj(cls_out)
+        q = self.q_proj(spatial_out)
         k = self.k_proj(gene_out)
         v = self.v_proj(gene_out)
 
@@ -137,6 +153,76 @@ class BulkRNAEncoder(nn.Module):
         else:
             return pooled
 
+class BulkExprEncoder(nn.Module):
+    def __init__(self, num_genes, embed_dim=256, num_layers=2, num_heads=4, top_k_genes=None):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_genes = num_genes
+        self.top_k_genes = top_k_genes
+
+        self.gene_embedding = nn.Embedding(num_genes, embed_dim)
+        self.gene_pos_embedding = nn.Embedding(num_genes, embed_dim)
+        self.value_embedding = nn.Sequential(
+            nn.Linear(1, embed_dim),
+            nn.LayerNorm(embed_dim),
+            nn.GELU()
+        )
+
+        self.transformer = Performer(
+            dim=embed_dim,
+            depth=num_layers,
+            heads=num_heads,
+            dim_head=embed_dim // num_heads,
+            causal=False,
+            ff_mult=4,
+            attn_dropout=0.1,
+            ff_dropout=0.1,
+        )
+
+        # spatial token 대신 learnable query
+        self.query_token = nn.Parameter(torch.randn(1, 1, embed_dim) * 0.02)
+        
+        self.q_proj = nn.Linear(embed_dim, embed_dim)
+        self.k_proj = nn.Linear(embed_dim, embed_dim)
+        self.v_proj = nn.Linear(embed_dim, embed_dim)
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
+
+    def forward(self, expr_wsi, return_gene_attn=False):
+        # expr_wsi: (K,)
+        K = expr_wsi.shape[0]
+        device = expr_wsi.device
+
+        # Top-K (bulk-wise)
+        if self.top_k_genes and self.top_k_genes < K:
+            topk_values, topk_indices = torch.topk(expr_wsi, k=self.top_k_genes, dim=0)
+            gene_indices = topk_indices.long()                     # (top_k,)
+            gene_embed = self.gene_embedding(gene_indices)         # (top_k, D)
+            gene_pos  = self.gene_pos_embedding(gene_indices)      # (top_k, D)
+            value_emb = self.value_embedding(topk_values.unsqueeze(-1))  # (top_k, D)
+            gene_tokens = gene_embed + gene_pos + value_emb        # (top_k, D)
+        else:
+            gene_indices = torch.arange(K, device=device).long()   # (K,)
+            gene_embed = self.gene_embedding(gene_indices)         # (K, D)
+            gene_pos  = self.gene_pos_embedding(gene_indices)      # (K, D)
+            value_emb = self.value_embedding(expr_wsi.unsqueeze(-1))    # (K, D)
+            gene_tokens = gene_embed + gene_pos + value_emb        # (K, D)
+
+        tokens = gene_tokens.unsqueeze(0)                          # (1, K_used, D)
+        tokens = self.transformer(tokens)                          # (1, K_used, D)
+        gene_out = tokens
+
+        q = self.q_proj(self.query_token)                          # (1, 1, D)
+        k = self.k_proj(gene_out)                                  # (1, K_used, D)
+        v = self.v_proj(gene_out)                                  # (1, K_used, D)
+
+        attn = torch.softmax((q @ k.transpose(-2, -1)) / (self.embed_dim ** 0.5), dim=-1)  # (1,1,K_used)
+        pooled = (attn @ v).squeeze(1)                             # (1, D)
+        pooled = self.out_proj(pooled).squeeze(0)                  # (D,)
+
+        if return_gene_attn:
+            gene_attn = attn.squeeze(0).squeeze(0)                 # (K_used,)
+            return pooled, gene_attn, gene_indices
+        return pooled
 
 # =======================================================
 # 3. Spot Fusion Module (4 options: concat, attn, sim, gate)
@@ -281,6 +367,23 @@ class SpotFusionModule(nn.Module):
             fused = weights[:, 0:1] * img_feat + weights[:, 1:2] * st_feat  # (N, D)
             return self.proj(fused)  # (N, D)
 
+class WSIFusionModule(nn.Module):   # bulk용 WSI-level fusion
+    """
+    concat만
+    """
+    def __init__(self, embed_dim=256, dropout=0.2):
+        super().__init__()
+        self.fuse = nn.Sequential(
+            nn.Linear(embed_dim * 2, embed_dim),
+            nn.LayerNorm(embed_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, img_wsi, st_wsi):
+        # img_wsi: (D,), st_wsi: (D,)
+        x = torch.cat([img_wsi, st_wsi], dim=-1)   # (2D,)
+        return self.fuse(x)                        # (D,)
 
 # =======================================================
 # 4. MIL Attention Pooling (Spot → WSI)
@@ -307,9 +410,8 @@ class MILAttentionPooling(nn.Module):
         wsi_embed = torch.sum(weights * spot_embeds, dim=0)
         return wsi_embed, weights
 
-
 # =======================================================
-# 5. Linear Head (Image Encoder 뒤에 붙일 FC layer)
+# 5. Linear Head
 # =======================================================
 class LinearHead(nn.Module):
     def __init__(self, dim: int, use_ln: bool=True):
@@ -319,8 +421,7 @@ class LinearHead(nn.Module):
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.fc(self.ln(x))
-    
-    
+      
 # =======================================================
 # 6. Full Multi-Modal MIL Model (Freeze 지원)
 # =======================================================
@@ -333,40 +434,58 @@ class MultiModalMILModel(nn.Module):
         fusion_option='concat',
         top_k_genes=None,
         dropout=0.3,
-        freeze_image_encoder=True,  # ✅ 추가
+        freeze_image_encoder=True,
         mil_hidden_dim=128,
         mil_dropout=0.0,
         fusion_dropout=0.2,
         head_use_ln=True,
+
+        # ablation용
+        use_image =True,
+        use_st=True
     ):
         super().__init__()
+
+        assert use_image or use_st, "At least one modality must be used!!"
         
+        self.use_image = use_image
+        self.use_st = use_st
         self.fusion_option = fusion_option
         self.freeze_image_encoder = freeze_image_encoder
 
-        # ✅ Image Encoder + Head (freeze 가능)
-        self.img_encoder = ImageEncoder(embed_dim)
-        self.img_head = LinearHead(dim=embed_dim, use_ln=head_use_ln)  # ✅ 추가
-        
-        # ST Encoder (항상 학습)
-        self.rna_encoder = BulkRNAEncoder(
-            num_genes=num_genes,
-            embed_dim=embed_dim,
-            top_k_genes=top_k_genes,
-        )
+        # Ablation: conditional encoder
+        if self.use_image:
+            self.img_encoder = ImageEncoder(embed_dim)
+            self.img_head = LinearHead(dim=embed_dim, use_ln=head_use_ln)
+        else:
+            self.img_encoder = None
+            self.img_head = None
+
+        if self.use_st:
+            self.st_encoder = BulkExprEncoder(
+                num_genes=num_genes,
+                embed_dim=embed_dim,
+                top_k_genes=top_k_genes,
+            )
+        else:
+            self.st_encoder = None
         self.st_head = nn.Identity()
 
-        # ✅ Freeze 적용
-        if freeze_image_encoder:
+        # Freeze
+        if self.use_image and freeze_image_encoder:
             self.freeze_encoders()
-
+            
         # Fusion
-        self.fusion = SpotFusionModule(
-            embed_dim=embed_dim,
-            fusion_option=fusion_option,
-            dropout=fusion_dropout,
-        )
-        
+        # Ablation: multimodal일 때만 fusion 생성
+        if self.use_image and self.use_st:
+            self.wsi_fusion = WSIFusionModule(
+                embed_dim=embed_dim, 
+                dropout=fusion_dropout
+            )
+
+        else:
+            self.wsi_fusion = None
+
         # MIL Pooling
         self.mil_pooling = MILAttentionPooling(
             embed_dim=embed_dim,
@@ -388,78 +507,72 @@ class MultiModalMILModel(nn.Module):
 
     def freeze_encoders(self):
         """ResNet backbone만 freeze"""
+        if self.img_encoder is None:    # Ablation
+            return
         for param in self.img_encoder.parameters():
             param.requires_grad = False
         self.img_encoder.eval()
     
     def train(self, mode: bool=True):
-        """Training 모드에서도 Image Encoder는 eval 유지"""
+        """Keep image encoder as eval during training"""
         super().train(mode)
-        if self.freeze_image_encoder:
+        if self.use_image and self.freeze_image_encoder:
             self.img_encoder.eval()
 
-    def forward(self, img_feat_all, bulk_vec, return_gene_attn=False, return_spot_embeds=False):
+    def forward(self, images, expr, return_gene_attn=True, return_spot_embeds=True):
         """
-        train_bulk.py 호환 버전 (slide-level fusion)
-
-        Inputs:
-        - img_feat_all: (N_spots, D)   # train_bulk.py에서 img_encoder+img_head로 만든 feature
-        - bulk_vec    : (K,) or (1,K)  # sample-level bulk expression
-
+        images: (N_spots, 3, 224, 224)
+        expr  : (K,)
+        
         Returns:
-        out["logits"]     : (num_classes,)
-        out["mil_attn"]   : (N_spots,)           # 이미지 MIL attention (patch/spot 중요도)
-        out["gene_attn"]  : (G_used,) or None    # bulk gene attention (top-k 사용 시 top-k 길이)
-        out["gene_indices"]: (G_used,) or None
-        out["spot_embeds"]: (N_spots, D) optional (여기서는 보통 img_feat_all 또는 None)
+          logits: (num_classes,)
+          attn: (N_spots, 1)
         """
-        device = img_feat_all.device
+        spot_embeds = None
+        mil_attn = None
+        gene_attn = None
+        gene_indices = None
+        img_wsi = None
+        st_wsi = None
+        
+        # Ablation: conditional encoding
+        if self.use_image:  # img branch
+            if self.freeze_image_encoder:
+                with torch.no_grad():
+                    img_feat = self.img_encoder(images)
+            else:
+                img_feat = self.img_encoder(images)
+            img_feat = self.img_head(img_feat)  # FC layer (trainable)
 
-        # -------------------------
-        # 1) Image: spot -> slide embedding
-        # -------------------------
-        # img_feat_all is already (N_spots, D)
-        wsi_img, mil_attn = self.mil_pooling(img_feat_all)  # (D,), (N_spots,1)
-        mil_attn = mil_attn.squeeze(-1)                     # (N_spots,)
+            spot_embeds = img_feat  # (N, D)
+            img_wsi, mil_attn = self.mil_pooling(spot_embeds)   # (D, )
+            mil_attn = mil_attn.squeeze(-1)  # (N_spots,)       # (N, )
 
-        # -------------------------
-        # 2) Bulk: one-time slide embedding
-        # -------------------------
-        if isinstance(bulk_vec, np.ndarray):
-            bulk_vec = torch.from_numpy(bulk_vec)
+        if self.use_st:     # bulk st branch
+            if return_gene_attn:
+                st_wsi, gene_attn, gene_indices = self.st_encoder(expr, return_gene_attn=True)
+            else:
+                st_wsi = self.st_encoder(expr, return_gene_attn=False)
+                gene_attn, gene_indices = None, None
+        
+        # Ablation: process spot embedding per modality
+        if self.use_image and self.use_st:  # Both modalities: Fusion
+            wsi_embed = self.wsi_fusion(img_wsi, st_wsi)
+        elif self.use_image:    # Image only
+            wsi_embed = img_wsi
+        elif self.use_st:       # ST only
+            wsi_embed = st_wsi
 
-        if bulk_vec.dim() == 1:          # (K,)
-            bulk_vec = bulk_vec.unsqueeze(0)  # (1,K)
-        bulk_vec = bulk_vec.to(device)
-
-        if return_gene_attn:
-            wsi_bulk, gene_attn, gene_indices = self.rna_encoder(bulk_vec, return_gene_attn=True)
-            # shapes: wsi_bulk (1,D), gene_attn (1,G_used), gene_indices (1,G_used)
-            gene_attn = gene_attn.squeeze(0)          # (G_used,)
-            gene_indices = gene_indices.squeeze(0)    # (G_used,)
-            wsi_bulk = wsi_bulk.squeeze(0)            # (D,)
-        else:
-            wsi_bulk = self.rna_encoder(bulk_vec, return_gene_attn=False).squeeze(0)  # (D,)
-            gene_attn, gene_indices = None, None
-
-        # -------------------------
-        # 3) Slide-level fusion (reuse SpotFusionModule with N=1)
-        # -------------------------
-        fused_slide = self.fusion(wsi_img.unsqueeze(0), wsi_bulk.unsqueeze(0)).squeeze(0)  # (D,)
-
-        # -------------------------
-        # 4) Classify
-        # -------------------------
-        logits = self.classifier(fused_slide)  # (num_classes,)
-
+        # Classification
+        logits = self.classifier(wsi_embed)
+        
         out = {
             "logits": logits,
             "mil_attn": mil_attn,
             "gene_attn": gene_attn,
             "gene_indices": gene_indices,
         }
-
         if return_spot_embeds:
-            out["spot_embeds"] = img_feat_all
+            out["spot_embeds"] = spot_embeds
 
-        return out
+        return out  
