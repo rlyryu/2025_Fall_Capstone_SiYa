@@ -145,6 +145,7 @@ class WSIDataset(Dataset):
                     expr_aligned[:, new_idx] = full_expr[:, old_idx]
 
             barcodes_st = adata.obs_names.to_numpy()
+            coords_raw_full = np.array(adata.obsm["spatial"])  # (n_spots, 2) in original coordinate system
             label_val = sample.label
 
             del full_expr, X_raw
@@ -188,6 +189,7 @@ class WSIDataset(Dataset):
             images_np = imgs[patch_idx]                # (N, H, W, C)
             expr_np = expr_aligned[st_idx]             # (N, G)
             expr_wsi = expr_np.mean(axis=0).astype(np.float32)  # (G,)
+            coords_raw_np = coords_raw_full[st_idx].astype(np.float32)  # (N, 2)
 
             # -------------------------
             # 4) Spot sampling (keep trace) -> bulk용 수정: sampling only for images 
@@ -199,12 +201,14 @@ class WSIDataset(Dataset):
                 patch_idx = patch_idx[sel]
                 st_idx = st_idx[sel]
                 aligned_barcodes = [aligned_barcodes[i] for i in sel.tolist()]
+                coords_raw_np = coords_raw_np[sel]
 
             # -------------------------
             # 5) Tensor conversion
             # -------------------------
             images = torch.from_numpy(images_np).permute(0, 3, 1, 2).float() / 255.0
             expr = torch.from_numpy(expr_wsi).float()
+            coords_raw = torch.from_numpy(coords_raw_np).float()
 
             out = {
                 "images": images,
@@ -212,6 +216,7 @@ class WSIDataset(Dataset):
                 "label": torch.tensor(label_val).long(),
                 "sample_id": sample.sample_id,
                 "num_spots": int(images.shape[0]),
+                "coords_raw": coords_raw
             }
 
             if self.return_trace:
