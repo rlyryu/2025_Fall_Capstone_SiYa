@@ -19,8 +19,8 @@ from tqdm import tqdm
 from sklearn.model_selection import train_test_split
 from contextlib import nullcontext
 
-from dataset.loader import CustomSample, create_wsi_dataloader
-from models.model_ablation import MultiModalMILModel
+from dataset.loader_bulk import CustomSample, create_wsi_dataloader
+from models.model_bulk import MultiModalMILModel
 
 
 # ===============================================
@@ -200,92 +200,85 @@ def prepare_data_splits(root_dir, seed=42):
 
 
 # ===============================================
-# Spot encoding helper (chunk-wise, ablation-aware)
+# Bulk encoding helper (chunk-wise, ablation-aware)
 # ===============================================
-def encode_spots_chunkwise(model, batch, config, device):
+def forward_bulk_early_fusion_chunkwise(model, batch, config, device):
     """
     Returns:
-      spot_embeds: (N_spots, D) on GPU
+      logits: (num_classes,)
+      mil_attn: (N_spots,) or None
+      gene_attn, gene_indices: optional (bulk)
     """
     use_image = config["use_image"]
     use_st = config["use_st"]
     freeze_img = config["freeze_image_encoder"]
 
-    images = batch["images"] if use_image else None
-    expr = batch["expr"] if use_st else None
-    coords = batch["coords"] if use_st else None
+    images = batch["images"] if use_image else None          # (N,3,224,224)
+    expr_wsi = batch["expr"] if use_st else None             # (K,)
 
-    # N_spots: choose from whichever exists
+    if use_st:
+        # make sure expr_wsi is (K,)
+        if expr_wsi.dim() == 2 and expr_wsi.size(0) == 1:
+            expr_wsi = expr_wsi.squeeze(0)
+            
+    # bulk ST branch
+    gene_attn = gene_indices = None
+    if use_st:
+        expr_wsi = expr_wsi.to(device)
+        if "return_gene_attn" in model.st_encoder.forward.__code__.co_varnames:
+            st_wsi = model.st_encoder(expr_wsi, return_gene_attn=False)  # training: False
+        else:
+            st_wsi = model.st_encoder(expr_wsi)
+    else:
+        st_wsi = None
+
+    # image branch: chunkwise encode spots -> MIL
     if use_image:
         N = images.size(0)
-    else:
-        N = expr.size(0)
+        spot_list = []
 
-    spot_embeds_list = []
+        use_amp = True
+        amp_ctx = autocast() if use_amp else nullcontext()
 
-    # use_amp = config["use_image"]
-    use_amp = True
-    amp_ctx = autocast() if use_amp else nullcontext()
+        for i in range(0, N, config["batch_spots"]):
+            j = min(i + config["batch_spots"], N)
+            img_b = images[i:j].to(device)
 
-    for i in range(0, N, config["batch_spots"]):
-        j = min(i + config["batch_spots"], N)
-
-        img_b = images[i:j].to(device) if use_image else None
-        expr_b = expr[i:j].to(device) if use_st else None
-        coord_b = coords[i:j].to(device) if use_st else None
-
-        with amp_ctx:
-            # ----- Image branch -----
-            if use_image:
+            with amp_ctx:
                 if freeze_img:
                     with torch.no_grad():
                         img_feat = model.img_encoder(img_b)
                 else:
                     img_feat = model.img_encoder(img_b)
-                # img_head always trainable (exists when use_image=True)
                 img_feat = model.img_head(img_feat)
-            else:
-                img_feat = None
 
-            # ----- ST branch -----
-            if use_st:
-                # training에서는 gene_attn 필요 없으니 return_gene_attn=False로 두는 게 빠름
-                st_feat = model.st_encoder(expr_b, coord_b, return_gene_attn=False) \
-                    if "return_gene_attn" in model.st_encoder.forward.__code__.co_varnames \
-                    else model.st_encoder(expr_b, coord_b)
-            else:
-                st_feat = None
-
-            # ----- Routing -----
-            if use_image and use_st:
-                # multimodal
-                fused = model.fusion(img_feat, st_feat)
-                spot_embeds_chunk = fused
-            elif use_image:
-                # image-only
-                spot_embeds_chunk = img_feat
-            else:
-                # st-only
-                spot_embeds_chunk = st_feat
-
-        # spot_embeds_list.append(spot_embeds_chunk.detach().cpu())
-        spot_embeds_list.append(spot_embeds_chunk)
-
-        # cleanup
-
-        if use_image:
+            spot_list.append(img_feat)
             del img_b, img_feat
-        if use_st:
-            del expr_b, coord_b, st_feat
+            torch.cuda.empty_cache()
 
-        del spot_embeds_chunk
-        torch.cuda.empty_cache()
+        spot_embeds = torch.cat(spot_list, dim=0)  # (N,D)
 
-    # spot_embeds = torch.cat(spot_embeds_list, dim=0).to(device)
-    spot_embeds = torch.cat(spot_embeds_list, dim=0)
+        with amp_ctx:
+            img_wsi, mil_attn = model.mil_pooling(spot_embeds)
+            mil_attn = mil_attn.squeeze(-1)  # (N,)
+        del spot_embeds
+    else:
+        img_wsi, mil_attn = None, None
 
-    return spot_embeds
+    # WSI-level early fusion & classifier
+    use_amp = True
+    amp_ctx = autocast() if use_amp else nullcontext()
+    with amp_ctx:
+        if use_image and use_st:
+            wsi_embed = model.wsi_fusion(img_wsi, st_wsi)
+        elif use_image:
+            wsi_embed = img_wsi
+        else:
+            wsi_embed = st_wsi
 
+        logits = model.classifier(wsi_embed)
+
+    return logits, mil_attn
 
 # ===============================================
 # Training / Validation
@@ -306,15 +299,9 @@ def train_epoch(model, loader, criterion, optimizer, scaler, config, device):
 
     for step, batch in enumerate(loop):
         label = batch["label"].to(device)
-
-        # (1) chunk-wise spot encoding with modality routing
-        spot_embeds = encode_spots_chunkwise(model, batch, config, device)
-
-        # (2) MIL + classifier (same for all ablations)
-
+        
         with amp_ctx:
-            wsi_embed, _ = model.mil_pooling(spot_embeds)
-            logits = model.classifier(wsi_embed.unsqueeze(0)).squeeze(0)
+            logits, _ = forward_bulk_early_fusion_chunkwise(model, batch, config, device)
             loss = criterion(logits.unsqueeze(0), label.unsqueeze(0))
             loss = loss / config["accum_steps"]
 
@@ -345,7 +332,7 @@ def train_epoch(model, loader, criterion, optimizer, scaler, config, device):
             acc=f"{100*correct/(step+1):.1f}%"
         )
 
-        del spot_embeds, wsi_embed, logits, loss
+        del logits, loss
         torch.cuda.empty_cache()
         
     # after loop ends: flush remaining grads once
@@ -361,7 +348,7 @@ def train_epoch(model, loader, criterion, optimizer, scaler, config, device):
         else:
             optimizer.step()
         optimizer.zero_grad()
-
+        
     return epoch_loss / len(loader), 100 * correct / len(loader)
 
 
@@ -380,14 +367,11 @@ def validate(model, loader, criterion, config, device):
     for batch in tqdm(loader, desc="Validation"):
         label = batch["label"].to(device)
 
-        spot_embeds = encode_spots_chunkwise(model, batch, config, device)
-
         # use_amp = config["use_image"]
         use_amp = True
         amp_ctx = autocast() if use_amp else nullcontext()
         with amp_ctx:
-            wsi_embed, _ = model.mil_pooling(spot_embeds)
-            logits = model.classifier(wsi_embed.unsqueeze(0)).squeeze(0)
+            logits, _ = forward_bulk_early_fusion_chunkwise(model, batch, config, device)
             loss = criterion(logits.unsqueeze(0), label.unsqueeze(0))
 
         val_loss += loss.item()
@@ -400,7 +384,7 @@ def validate(model, loader, criterion, config, device):
         y_score.append(prob_pos)
         y_pred.append(pred)
 
-        del spot_embeds, wsi_embed, logits, loss
+        del logits, loss
         torch.cuda.empty_cache()
 
     val_loss = val_loss / len(loader)
@@ -458,7 +442,7 @@ def main():
         fusion_option=CONFIG["fusion_option"],
         top_k_genes=CONFIG.get("top_k_genes"),
 
-        # ablation flags into model
+        # ✅ ablation flags into model
         use_image=CONFIG["use_image"],
         use_st=CONFIG["use_st"],
 
