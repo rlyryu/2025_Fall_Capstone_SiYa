@@ -1,3 +1,19 @@
+"""
+This script trains a multimodal MIL model on the bulk-encoded WSI dataset.
+It supports ablation by toggling the use of image and/or ST modalities via the config YAML.
+
+Expected directory structure:
+root_dir/
+    ├── st_preprocessed_global_hvg/
+    │       ├── sample1.h5ad
+    │       ├── sample2.h5ad
+    │       └── ...
+    └── patches/
+            ├── sample1.h5
+            ├── sample2.h5
+            └── ...
+"""
+
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -27,6 +43,9 @@ from models.model_bulk import MultiModalMILModel
 # YAML Config Loader
 # ===============================================
 def load_config(path="configs/train_ablation.yaml"):
+    """
+    Load training configuration from a YAML file.
+    """
     with open(path, "r") as f:
         cfg = yaml.safe_load(f)
 
@@ -42,7 +61,7 @@ def load_config(path="configs/train_ablation.yaml"):
         "fusion_option": cfg["model"].get("fusion_option", "concat"),
         "top_k_genes": cfg["model"].get("top_k_genes"),
 
-        # ✅ Ablation flags (default: multimodal)
+        # Ablation flags (default: multimodal)
         "use_image": cfg["model"].get("use_image", True),
         "use_st": cfg["model"].get("use_st", True),
 
@@ -71,22 +90,23 @@ def load_config(path="configs/train_ablation.yaml"):
 # Utils
 # ===============================================
 def set_seed(seed):
+    """Set random seed for reproducibility."""
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     import numpy as np
     np.random.seed(seed)
 
-def plot_confusion_matrix(
-  cm, 
-  class_names=('0', '1'),
-  title="Confusion Matrix",
-  save_path = None
-):
+def plot_confusion_matrix(cm, class_names=('0', '1'), title="Confusion Matrix", save_path = None):
     """
-    cm: np.array shape (2, 2) [[TN, FP]. [FN, TP]]
+    Plot confusion matrix with counts and save/show.
+    Args:
+        cm: 2D array-like confusion matrix (e.g., [[TN, FP], [FN, TP]])
+        class_names: Tuple of class names for axes labels
+        title: Title of the plot
+        save_path: If provided, saves the plot to this path. Otherwise, shows it.
     """
     fig, ax = plt.subplots(figsize=(4, 4))
-    im = ax.imshow(cm)
+    im = ax.imshow(cm, cmap="Blues")
 
     # ticks / labels
     ax.set_xticks(np.arange(len(class_names)))
@@ -98,13 +118,15 @@ def plot_confusion_matrix(
     ax.set_ylabel("True label")
     ax.set_title(title)
 
-    # 숫자 표시
+    threshold = cm.max() / 2
+
     for i in range(cm.shape[0]):
         for j in range(cm.shape[1]):
             ax.text(
                 j, i, cm[i, j],
                 ha="center", va="center",
-                fontsize=12
+                fontsize=12,
+                color="white" if cm[i, j] > threshold else "black"
             )
     
     fig.tight_layout()
@@ -116,6 +138,13 @@ def plot_confusion_matrix(
         plt.show()
 
 def plot_acc_curve(history, save_prefix=None, show=False):
+    """
+    Plot training and validation accuracy curves.
+    Args:
+        history: Dict containing "train_acc" and "val_acc" lists.
+        save_prefix: If provided, saves the plot with this prefix. Otherwise, shows it.
+        show: If True, displays the plot. If False, saves and closes it.
+    """
     epochs = np.arange(1, len(history["train_acc"])+1)
 
     fig, ax = plt.subplots(figsize=(6, 4))
@@ -133,6 +162,13 @@ def plot_acc_curve(history, save_prefix=None, show=False):
         plt.close(fig)
 
 def plot_loss_curve(history, save_prefix=None, show=False):
+    """
+    Plot training and validation loss curves.
+    Args:
+        history: Dict containing "train_loss" and "val_loss" lists.
+        save_prefix: If provided, saves the plot with this prefix. Otherwise, shows it.
+        show: If True, displays the plot. If False, saves and closes it.
+    """
     epochs = np.arange(1, len(history["train_loss"])+1)
 
     fig, ax = plt.subplots(figsize=(6, 4))
@@ -153,6 +189,13 @@ def plot_loss_curve(history, save_prefix=None, show=False):
 # Data Split
 # ===============================================
 def prepare_data_splits(root_dir, seed=42):
+    """
+    Prepare train/validation splits based on available samples in the dataset.
+    Only samples that have both ST and image data will be included.
+    Returns:
+        train_samples: List of CustomSample objects for training
+        val_samples: List of CustomSample objects for validation
+    """
     st_dir = os.path.join(root_dir, "st_preprocessed_global_hvg")
     patch_dir = os.path.join(root_dir, "patches")
 
@@ -170,7 +213,7 @@ def prepare_data_splits(root_dir, seed=42):
                 samples.append(sample)
                 labels.append(sample.label)
             else:
-                print(f"⚠️  Skipping {sid} (label={sample.label})")
+                print(f"Skipping {sid} (label={sample.label})")
         except Exception as e:
             print(f"Failed to load {sid}: {e}")
 
@@ -204,10 +247,15 @@ def prepare_data_splits(root_dir, seed=42):
 # ===============================================
 def forward_bulk_early_fusion_chunkwise(model, batch, config, device):
     """
+    Forward pass for a single WSI sample with optional image and ST branches.
+    Args:
+        model: The MultiModalMILModel instance
+        batch: A dict containing "images" and/or "expr" tensors for the sample
+        config: The training configuration dict (to check which modalities to use)
+        device: The torch device to run on
     Returns:
-      logits: (num_classes,)
-      mil_attn: (N_spots,) or None
-      gene_attn, gene_indices: optional (bulk)
+        logits: The output logits from the classifier
+        mil_attn: The attention weights from the MIL pooling (if image branch is used)
     """
     use_image = config["use_image"]
     use_st = config["use_st"]
@@ -284,6 +332,17 @@ def forward_bulk_early_fusion_chunkwise(model, batch, config, device):
 # Training / Validation
 # ===============================================
 def train_epoch(model, loader, criterion, optimizer, scaler, config, device):
+    """
+    Train the model for one epoch with gradient accumulation.
+    Args:
+        model: The MultiModalMILModel instance
+        loader: The data loader for the training set
+        criterion: The loss function
+        optimizer: The optimizer
+        scaler: The gradient scaler for mixed precision training
+        config: The training configuration dict
+        device: The torch device to run on
+    """
     model.train()
     if config["freeze_image_encoder"] and config["use_image"]:
         model.img_encoder.eval()
@@ -354,6 +413,17 @@ def train_epoch(model, loader, criterion, optimizer, scaler, config, device):
 
 @torch.no_grad()
 def validate(model, loader, criterion, config, device):
+    """
+    Validate the model on the validation set.
+    Args:
+        model: The MultiModalMILModel instance
+        loader: The data loader for the validation set
+        criterion: The loss function
+        config: The training configuration dict
+        device: The torch device to run on
+    Returns:
+        val_loss, val_acc, auc, p, r, f1, cm
+    """
     model.eval()
     if config["freeze_image_encoder"] and config["use_image"]:
         model.img_encoder.eval()
@@ -442,7 +512,7 @@ def main():
         fusion_option=CONFIG["fusion_option"],
         top_k_genes=CONFIG.get("top_k_genes"),
 
-        # ✅ ablation flags into model
+        # ablation flags into model
         use_image=CONFIG["use_image"],
         use_st=CONFIG["use_st"],
 
