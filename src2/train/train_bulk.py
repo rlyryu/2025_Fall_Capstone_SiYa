@@ -32,7 +32,7 @@ from contextlib import nullcontext
 
 from dataset.loader_bulk import create_wsi_dataloader
 from models.model_bulk import MultiModalMILModel
-from utils import load_config, set_seed, plot_confusion_matrix, plot_acc_curve, plot_loss_curve, prepare_data_splits
+from train.utils import load_config, set_seed, plot_confusion_matrix, plot_acc_curve, plot_loss_curve, prepare_data_splits
 
 # ===============================================
 # Bulk encoding helper (chunk-wise, ablation-aware)

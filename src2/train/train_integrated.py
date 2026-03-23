@@ -35,12 +35,12 @@ from tqdm import tqdm
 from sklearn.model_selection import train_test_split
 from contextlib import nullcontext
 
-from dataset.loader import CustomSample, create_wsi_dataloader
+from dataset.loader import create_wsi_dataloader
 from models.model_ablation import MultiModalMILModel
 
-from dataset.loader_bulk import CustomSample as CustomSampleBulk, create_wsi_dataloader as create_wsi_dataloader_bulk
+from dataset.loader_bulk import create_wsi_dataloader as create_wsi_dataloader_bulk
 from models.model_bulk import MultiModalMILModel as MultiModalMILModelBulk
-from utils import load_config, set_seed, plot_confusion_matrix, plot_acc_curve, plot_loss_curve, prepare_data_splits
+from train.utils import load_config, set_seed, plot_confusion_matrix, plot_acc_curve, plot_loss_curve, prepare_data_splits
 
 # ===============================================
 # Spot encoding helper (chunk-wise, ablation-aware)
