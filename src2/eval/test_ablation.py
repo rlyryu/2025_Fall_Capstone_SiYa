@@ -1,3 +1,14 @@
+"""
+Ablation test for XAI outputs of the MultiModalMILModel.
+- Modality ablation: image-only, ST-only, multimodal
+- For each sample, save:
+    - Prediction summary (JSON)
+    - Save embeddings + attention scores (NPY)
+    - Top-k important patches (images)
+    - Scatter plot of spot coordinates colored by MIL attention
+    - Top-k important genes (CSV)
+"""
+
 import os
 import json
 import argparse
@@ -9,150 +20,20 @@ from PIL import Image
 
 from dataset.loader import CustomSample, create_wsi_dataloader, load_global_gene_order
 from models.model_ablation import MultiModalMILModel
-
-"""
-An ablation ver. of test.py
-"""
-
-# Detect samples -> return
-def discover_samples(root_dir):
-    st_dir = os.path.join(root_dir, "st_preprocessed_global_hvg")
-    patch_dir = os.path.join(root_dir, "patches")
-
-    assert os.path.isdir(st_dir), f"ST dir not found: {st_dir}"
-    assert os.path.isdir(patch_dir), f"Patch dir not found: {patch_dir}"
-
-    sample_ids = []
-    for fn in os.listdir(st_dir):
-        if fn.endswith(".h5ad"):
-            sid = fn[:-5]
-            if os.path.exists(os.path.join(patch_dir, f"{sid}.h5")):
-                sample_ids.append(sid)
-    sample_ids.sort()
-
-    samples = [CustomSample(root_dir, sid) for sid in sample_ids]
-    return samples
-
-# UMAP/PCA util
-def compute_2d_embedding(X: np.ndarray, method: str = "umap", seed: int = 0):
-    """
-    X: (N, D)
-    returns: (N, 2)
-    """
-    if method == "umap":
-        try:
-            import umap
-            reducer = umap.UMAP(n_components=2, random_state=seed)
-            return reducer.fit_transform(X)
-        except Exception as e:
-            print(f"[warn] UMAP not available ({e}). Falling back to PCA.")
-            method = "pca"
-
-    if method == "pca":
-        from sklearn.decomposition import PCA
-        return PCA(n_components=2, random_state=seed).fit_transform(X)
-
-    raise ValueError(f"Unknown method: {method}")
-
-# top percent attn extraction util
-def make_top_percent_mask(attn: torch.Tensor, top_percent: float = 0.6, min_points: int = 10):
-    """
-    attn: (N,) torch.Tensor
-    top_percent: keep top 70% => 0.7
-    min_points: safety fallback (avoid empty / too few)
-    returns: mask (N,) bool torch.Tensor
-    """
-    attn = attn.view(-1)
-    N = attn.numel()
-    if N == 0:
-        return torch.zeros_like(attn, dtype=torch.bool)
-
-    # Apply threshold -> top 70%
-    q = 1.0 - float(top_percent)
-    q = min(max(q, 0.0), 1.0)
-
-    thr = torch.quantile(attn, q)
-    mask = attn >= thr
-
-    # fallback: top-k
-    if mask.sum().item() < min_points:
-        k = min(min_points, N)
-        idx = torch.topk(attn, k=k).indices
-        mask = torch.zeros(N, dtype=torch.bool, device=attn.device)
-        mask[idx] = True
-
-    return mask
-
-# IO utils
-def save_patch_image(tensor_chw, out_path):
-    """
-    tensor_chw: torch.Tensor (3,H,W), range ~[0,1]
-    """
-    x = tensor_chw.detach().cpu().clamp(0, 1)
-    x = (x.permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
-    Image.fromarray(x).save(out_path)
-
-
-# Patches with high attn score -> scatter plot
-def plot_attention_scatter(coords_raw, attn, top10_idx, out_path,
-                           title="Spot importance (MIL attn)",
-                           mask=None):
-    """
-    coords_raw: (N,2) torch.Tensor
-    attn: (N,) torch.Tensor
-    mask: (N,) bool torch.Tensor (True만 plot)
-    """
-    c_all = coords_raw.detach().cpu().numpy()
-    a_all = attn.detach().cpu().numpy()
-
-    if mask is not None:
-        m = mask.detach().cpu().numpy().astype(bool)
-    else:
-        m = np.ones(len(a_all), dtype=bool)
-
-    c = c_all[m]
-    a = a_all[m]
-
-    if len(a) == 0:
-        plt.figure()
-        plt.title(title + " (empty after masking)")
-        plt.tight_layout()
-        plt.savefig(out_path, dpi=200)
-        plt.close()
-        return
-
-    a_min, a_max = float(a.min()), float(a.max())
-    denom = (a_max - a_min) if (a_max - a_min) > 1e-12 else 1.0
-    a_n = (a - a_min) / denom
-    sizes = 10 + 200 * a_n
-
-    plt.figure()
-    plt.scatter(c[:, 0], c[:, 1], s=sizes)  # 백지 위 scatter
-
-    if top10_idx is not None and len(top10_idx) > 0:
-        sel = np.array(top10_idx, dtype=np.int64)
-        sel = sel[sel < len(m)]          # boundary safety
-        sel = sel[m[sel]]                # mask 통과한 top10만 남김
-        if len(sel) > 0:
-            plt.scatter(c_all[sel, 0], c_all[sel, 1], s=250, marker="x")
-            for rank, i in enumerate(sel.tolist(), start=1):
-                plt.text(c_all[i, 0], c_all[i, 1], f"Top{rank}", fontsize=10)
-
-    plt.title(title)
-    plt.xlabel("x")
-    plt.ylabel("y")
-    plt.gca().invert_yaxis()
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=200)
-    plt.close()
+from eval.utils import discover_samples, make_top_percent_mask, save_patch_image, plot_attention_scatter
 
 # Important gene list
 def aggregate_top_genes(gene_attn, gene_indices, mil_attn, gene_order, topk=30):
     """
-    gene_attn: (N, G) torch.Tensor (per-spot attention over gene tokens)
-    gene_indices: (N, G) torch.LongTensor
-    mil_attn: (N,) torch.Tensor  (spot importance)
-    gene_order: list[str] length K_global
+    Aggreate gene importance scores across all spots, weighted by MIL attention.
+    Args:
+        gene_attn: (N, G) torch.Tensor (per-spot attention over gene tokens)
+        gene_indices: (N, G) torch.LongTensor
+        mil_attn: (N,) torch.Tensor  (spot importance)
+        gene_order: list[str] length K_global
+        topk: int, number of top genes to return
+    Returns:
+        list[tuple[str, float]]: List of (gene_name, aggregated_score) tuples
     """
     N, G = gene_attn.shape
     mil_w = mil_attn.view(N, 1)
@@ -178,6 +59,7 @@ def main():
     parser.add_argument("--root_dir", type=str, required=True)
     parser.add_argument("--ckpt", type=str, required=True)
     parser.add_argument("--out_dir", type=str, default="./xai_outputs")
+    parser.add_argument("--emb_dir", type=str, default="./embeddings")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
 
     # model params
@@ -227,6 +109,9 @@ def main():
     
     args.out_dir = f"{args.out_dir}_{mode_suffix}"
     os.makedirs(args.out_dir, exist_ok=True)
+
+    args.emb_dir = f"{args.emb_dir}_{mode_suffix}"
+    os.makedirs(args.emb_dir, exist_ok=True)
 
     # samples + loader
     samples = discover_samples(args.root_dir)
@@ -311,11 +196,46 @@ def main():
                 raise ValueError("Model must return a dict with keys: logits, mil_attn, spot_embeds, ...")
 
             logits = outputs.get("logits", None)
+
             mil_attn = outputs.get("mil_attn", None)
+            # save mil attn
+            if mil_attn is not None:
+                mil_attn_np = mil_attn.view(-1).detach().cpu().numpy()
+                
+                mil_attn_filename = f"{sample_id}_{mode_suffix}_mil_attn.npy"
+                mil_attn_path = os.path.join(args.emb_dir, mil_attn_filename)
+
+                np.save(mil_attn_path, mil_attn_np)
+                print(f"[saved] {mil_attn_filename}  shape={mil_attn_np.shape}")
+        
             spot_embeds = outputs.get("spot_embeds", None)
+            # save embeddings
+            if spot_embeds is not None:
+                embeds_np = spot_embeds.detach().cpu().numpy()
+
+                embed_filename = f"{sample_id}_{mode_suffix}_embedding.npy"
+                embed_path = os.path.join(args.emb_dir, embed_filename)
+
+                np.save(embed_path, embeds_np)
+                print(f"[saved] {embed_filename}  shape={embeds_np.shape}")
+        
 
             gene_attn = outputs.get("gene_attn", None)
             gene_indices = outputs.get("gene_indices", None)
+            # save gene attn
+            if gene_attn is not None and gene_indices is not None:
+                gene_attn_np = gene_attn.detach().cpu().numpy()
+                gene_indices_np = gene_indices.detach().cpu().numpy()
+
+                gene_attn_filename = f"{sample_id}_{mode_suffix}_gene_attn.npy"
+                gene_indices_filename = f"{sample_id}_{mode_suffix}_gene_indices.npy"
+
+                np.save(os.path.join(args.emb_dir, gene_attn_filename), gene_attn_np)
+                np.save(os.path.join(args.emb_dir, gene_indices_filename), gene_indices_np)
+
+                print(f"[saved] {gene_attn_filename}  shape={gene_attn_np.shape}")
+                print(f"[saved] {gene_indices_filename}  shape={gene_indices_np.shape}")
+            
 
             if logits is None:
                 raise ValueError("Model dict output must contain 'logits'.")
@@ -352,40 +272,6 @@ def main():
 
             # Top-10 important spots
             top10 = torch.topk(mil_attn, k=min(10, n_spots)).indices.detach().cpu().tolist()
-
-            # UMAP/PCA
-            if spot_embeds is not None:
-                X = spot_embeds.detach().cpu().numpy()
-                Z = compute_2d_embedding(X, method=args.embed_2d, seed=0)
-
-                a = mil_attn.detach().cpu().numpy()
-                a_min, a_max = float(a.min()), float(a.max())
-                denom = (a_max - a_min) if (a_max - a_min) > 1e-12 else 1.0
-                a_n = (a - a_min) / denom
-
-                plt.figure()
-                plt.scatter(Z[:, 0], Z[:, 1], s=10 + 200 * a_n)
-                plt.title(f"{args.embed_2d.upper()} of spot embeddings (size=mil_attn)")
-                plt.xlabel(f"{args.embed_2d.upper()}-1")
-                plt.ylabel(f"{args.embed_2d.upper()}-2")
-                plt.tight_layout()
-                plt.savefig(os.path.join(out_dir, f"spot_embeds_{args.embed_2d}.png"), dpi=200)
-                plt.close()
-
-                plt.figure()
-                plt.scatter(
-                    Z[:, 0], Z[:, 1],
-                    c=a_n,
-                    s=10 + 200 * a_n,
-                    cmap="viridis"
-                )
-                plt.colorbar(label="MIL attention")
-                plt.title(f"{args.embed_2d.upper()} of spot embeddings (color+size=mil_attn)")
-                plt.xlabel(f"{args.embed_2d.upper()}-1")
-                plt.ylabel(f"{args.embed_2d.upper()}-2")
-                plt.tight_layout()
-                plt.savefig(os.path.join(out_dir, f"spot_embeds_{args.embed_2d}_color.png"), dpi=200)
-                plt.close()
 
             # Top-k patches
             if args.use_image and images is not None:
