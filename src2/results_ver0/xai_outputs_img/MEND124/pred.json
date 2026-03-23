@@ -1,0 +1,15 @@
+{
+  "sample_id": "MEND124",
+  "gt_label": 0,
+  "pred_label": 0,
+  "probs": [
+    0.8162822723388672,
+    0.1837177276611328
+  ],
+  "num_spots_used": 1421,
+  "use_image": true,
+  "use_st": false,
+  "mil_attn_available": true,
+  "spot_embeds_available": true,
+  "gene_xai_available": false
+}
