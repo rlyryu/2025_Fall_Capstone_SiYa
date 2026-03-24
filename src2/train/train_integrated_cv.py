@@ -34,6 +34,7 @@ from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
 from sklearn.model_selection import train_test_split
 from contextlib import nullcontext
+import math
 
 from dataset.loader import create_wsi_dataloader
 from models.model_ablation import MultiModalMILModel
@@ -67,10 +68,6 @@ def encode_spots_chunkwise(model, batch, config, device):
 
     spot_embeds_list = []
 
-    # use_amp = config["use_image"]
-    use_amp = True
-    amp_ctx = autocast() if use_amp else nullcontext()
-
     for i in range(0, N, config["batch_spots"]):
         j = min(i + config["batch_spots"], N)
 
@@ -78,39 +75,38 @@ def encode_spots_chunkwise(model, batch, config, device):
         expr_b = expr[i:j].to(device) if use_st else None
         coord_b = coords[i:j].to(device) if use_st else None
 
-        with amp_ctx:
-            # ----- Image branch -----
-            if use_image:
-                if freeze_img:
-                    with torch.no_grad():
-                        img_feat = model.img_encoder(img_b)
-                else:
+        # ----- Image branch -----
+        if use_image:
+            if freeze_img:
+                with torch.no_grad():
                     img_feat = model.img_encoder(img_b)
-                # img_head always trainable (exists when use_image=True)
-                img_feat = model.img_head(img_feat)
             else:
-                img_feat = None
+                img_feat = model.img_encoder(img_b)
+            # img_head always trainable (exists when use_image=True)
+            img_feat = model.img_head(img_feat)
+        else:
+            img_feat = None
 
-            # ----- ST branch -----
-            if use_st:
-                # training에서는 gene_attn 필요 없으니 return_gene_attn=False로 두는 게 빠름
-                st_feat = model.st_encoder(expr_b, coord_b, return_gene_attn=False) \
-                    if "return_gene_attn" in model.st_encoder.forward.__code__.co_varnames \
-                    else model.st_encoder(expr_b, coord_b)
-            else:
-                st_feat = None
+        # ----- ST branch -----
+        if use_st:
+            # training에서는 gene_attn 필요 없으니 return_gene_attn=False로 두는 게 빠름
+            st_feat = model.st_encoder(expr_b, coord_b, return_gene_attn=False) \
+                if "return_gene_attn" in model.st_encoder.forward.__code__.co_varnames \
+                else model.st_encoder(expr_b, coord_b)
+        else:
+            st_feat = None
 
-            # ----- Routing -----
-            if use_image and use_st:
-                # multimodal
-                fused = model.fusion(img_feat, st_feat)
-                spot_embeds_chunk = fused
-            elif use_image:
-                # image-only
-                spot_embeds_chunk = img_feat
-            else:
-                # st-only
-                spot_embeds_chunk = st_feat
+        # ----- Routing -----
+        if use_image and use_st:
+            # multimodal
+            fused = model.fusion(img_feat, st_feat)
+            spot_embeds_chunk = fused
+        elif use_image:
+            # image-only
+            spot_embeds_chunk = img_feat
+        else:
+            # st-only
+            spot_embeds_chunk = st_feat
 
         # spot_embeds_list.append(spot_embeds_chunk.detach().cpu())
         spot_embeds_list.append(spot_embeds_chunk)
@@ -123,7 +119,7 @@ def encode_spots_chunkwise(model, batch, config, device):
             del expr_b, coord_b, st_feat
 
         del spot_embeds_chunk
-        torch.cuda.empty_cache()
+        # torch.cuda.empty_cache()
 
     # spot_embeds = torch.cat(spot_embeds_list, dim=0).to(device)
     spot_embeds = torch.cat(spot_embeds_list, dim=0)
@@ -172,45 +168,37 @@ def forward_bulk_early_fusion_chunkwise(model, batch, config, device):
         N = images.size(0)
         spot_list = []
 
-        use_amp = True
-        amp_ctx = autocast() if use_amp else nullcontext()
-
         for i in range(0, N, config["batch_spots"]):
             j = min(i + config["batch_spots"], N)
             img_b = images[i:j].to(device)
 
-            with amp_ctx:
-                if freeze_img:
-                    with torch.no_grad():
-                        img_feat = model.img_encoder(img_b)
-                else:
+            if freeze_img:
+                with torch.no_grad():
                     img_feat = model.img_encoder(img_b)
-                img_feat = model.img_head(img_feat)
+            else:
+                img_feat = model.img_encoder(img_b)
+            img_feat = model.img_head(img_feat)
 
             spot_list.append(img_feat)
             del img_b, img_feat
-            torch.cuda.empty_cache()
+            # torch.cuda.empty_cache()
 
         spot_embeds = torch.cat(spot_list, dim=0)  # (N,D)
 
-        with amp_ctx:
-            img_wsi, mil_attn = model.mil_pooling(spot_embeds)
-            mil_attn = mil_attn.squeeze(-1)  # (N,)
+        img_wsi, mil_attn = model.mil_pooling(spot_embeds)
+        mil_attn = mil_attn.squeeze(-1)  # (N,)
     else:
         img_wsi, mil_attn = None, None
 
     # WSI-level early fusion & classifier
-    use_amp = True
-    amp_ctx = autocast() if use_amp else nullcontext()
-    with amp_ctx:
-        if use_image and use_st:
-            wsi_embed = model.wsi_fusion(img_wsi, st_wsi)
-        elif use_image:
-            wsi_embed = img_wsi
-        else:
-            wsi_embed = st_wsi
+    if use_image and use_st:
+        wsi_embed = model.wsi_fusion(img_wsi, st_wsi)
+    elif use_image:
+        wsi_embed = img_wsi
+    else:
+        wsi_embed = st_wsi
 
-        logits = model.classifier(wsi_embed)
+    logits = model.classifier(wsi_embed)
 
     return logits, mil_attn, wsi_embed, spot_embeds
 
@@ -254,25 +242,34 @@ def train_epoch(model, loader, criterion, optimizer, scaler, config, device, use
             loss = criterion(logits.unsqueeze(0), label.unsqueeze(0))
             loss = loss / config["accum_steps"]
 
+            if torch.isnan(loss):
+                print(f"NaN detected!")
+
+                optimizer.zero_grad()
+                break
+
         # backward + optimize -> 공통 ================================
+        accum_steps = config["accum_steps"]
+
         if use_amp:
             scaler.scale(loss).backward()
+
+            if (step + 1) % accum_steps == 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+
         else:
             loss.backward()
 
-        if (step + 1) % config["accum_steps"] == 0:
-            if use_amp:
-                scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(
-                filter(lambda p: p.requires_grad, model.parameters()), 1.0
-            )
+            if (step + 1) % accum_steps == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
-            if use_amp:
-                scaler.step(optimizer)
-                scaler.update()
-            else:
                 optimizer.step()
-            optimizer.zero_grad()
+                optimizer.zero_grad()
 
         epoch_loss += loss.item() * config["accum_steps"]
         correct += int(logits.argmax().item() == label.item())
@@ -306,11 +303,10 @@ def train_epoch(model, loader, criterion, optimizer, scaler, config, device, use
 
 
 @torch.no_grad()
-def validate(model, loader, criterion, config, device, use_amp,
-             save_embeddings=False, embedding_dir=None):
+def validate(model, loader, criterion, config, device, use_amp):
     """
     Validation loop that computes loss, accuracy, AUC, precision/recall/f1, and confusion matrix.
-    If save_embeddings=True, also saves spot and WSI embeddings for each sample in the specified directory
+    Also returns spot/wsi embeddings and sample ids.
     """
     model.eval()
     if config["freeze_image_encoder"] and config["use_image"]:
@@ -322,10 +318,15 @@ def validate(model, loader, criterion, config, device, use_amp,
     y_score = []  # prob of class 1
     y_pred = []   # predicted label (0/1)
 
+    all_spot_embeds = []
+    all_wsi_embeds = []
+    all_sample_ids = []
+
     amp_ctx = autocast() if use_amp else nullcontext()
 
     for batch in tqdm(loader, desc="Validation"):
         label = batch["label"].to(device)
+        sample_id = batch["sample_id"]
 
         with amp_ctx:
 
@@ -344,17 +345,7 @@ def validate(model, loader, criterion, config, device, use_amp,
             
             loss = criterion(logits.unsqueeze(0), label.unsqueeze(0))             
 
-        # save embeddings
-        if save_embeddings:
-            sample_id = batch["sample_id"]  # loader가 sample_id 반환해야 함
-
-            spot_path = os.path.join(embedding_dir, "spot", f"{sample_id}.npy")
-            np.save(spot_path, spot_embeds.detach().cpu().numpy())
-
-            # wsi embedding
-            wsi_path = os.path.join(embedding_dir, "wsi", f"{sample_id}.npy")
-            np.save(wsi_path, wsi_embed.detach().cpu().numpy())
-
+        # metrics
         val_loss += loss.item()
         pred = logits.argmax().item()
         correct += int(pred == label.item())
@@ -364,6 +355,10 @@ def validate(model, loader, criterion, config, device, use_amp,
         y_true.append(label.item())
         y_score.append(prob_pos)
         y_pred.append(pred)
+
+        all_spot_embeds.append(spot_embeds.detach().cpu())
+        all_wsi_embeds.append(wsi_embed.detach().cpu())
+        all_sample_ids.append(sample_id)
 
         del wsi_embed, logits, loss
         if not config["is_bulk"]:
@@ -393,7 +388,7 @@ def validate(model, loader, criterion, config, device, use_amp,
     # confusion matrix: [[TN, FP], [FN, TP]]
     cm = confusion_matrix(y_true, y_pred, labels = [0, 1])
 
-    return val_loss, val_acc, auc, p, r, f1, cm
+    return val_loss, val_acc, auc, p, r, f1, cm, all_spot_embeds, all_wsi_embeds, all_sample_ids
 
 
 # ===============================================
@@ -504,8 +499,6 @@ def main():
         os.makedirs(spot_dir, exist_ok=True)
         os.makedirs(wsi_dir, exist_ok=True)
 
-        ckpt_path = os.path.join(exp_dir, f"fold_{fold}_best_model.pt")
-
         # history for learning curves
         history = {
             "train_loss": [],
@@ -529,7 +522,8 @@ def main():
             train_loss, train_acc = train_epoch(
                     model, train_loader, criterion, optimizer, scaler, CONFIG, device, use_amp
                 )
-            val_loss, val_acc, val_auc, val_p, val_r, val_f1, cm = validate(
+            val_loss, val_acc, val_auc, val_p, val_r, val_f1, cm, \
+            spot_embeds_list, wsi_embeds_list, sample_ids = validate(
                 model, val_loader, criterion, CONFIG, device, use_amp
             )
 
@@ -551,16 +545,21 @@ def main():
 
             # best model일 때 저장
 
-            if val_acc > best_val_acc:
+            ckpt_path = os.path.join(exp_dir, f"fold_{fold}_best_model_epoch{epoch+1}.pt")
+
+            if val_acc > best_val_acc or (
+                val_acc == best_val_acc and 
+                (not math.isnan(val_auc)) and val_auc > best_val_auc
+            ):
                 best_val_acc = val_acc
                 best_val_auc = val_auc
                 best_val_f1  = val_f1
 
                 torch.save(model.state_dict(), ckpt_path)
 
-                validate(
-                    model, val_loader, criterion, CONFIG, device, use_amp, save_embeddings=True, embedding_dir=embedding_root
-                )
+                for spot, wsi, sid in zip(spot_embeds_list, wsi_embeds_list, sample_ids):
+                    np.save(os.path.join(spot_dir, f"{sid}.npy"), spot.numpy())
+                    np.save(os.path.join(wsi_dir, f"{sid}.npy"), wsi.numpy())
 
                 # confusion matrix -> best model일 때만 plot
                 plot_confusion_matrix(
