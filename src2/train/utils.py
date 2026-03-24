@@ -27,6 +27,7 @@ def load_config(path="configs/train_ablation.yaml"):
         # Data
         "root_dir": cfg["data"]["root_dir"],
         "max_spots": cfg["data"]["max_spots"],
+        "split_dir": cfg["data"]["split_dir"],
 
         # Model
         "num_genes": cfg["model"]["num_genes"],
