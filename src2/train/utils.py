@@ -221,3 +221,21 @@ def prepare_data_splits(root_dir, seed=42, is_bulk=False):
 
     print(f"\nSplit: {len(train_samples)} train, {len(val_samples)} val")
     return train_samples, val_samples
+
+def load_split_from_txt(root_dir, split_dir, fold):
+    """
+    A custom split script: supports a cross-validation by reading a fixed dataset id file.
+    """
+    fold_dir = os.path.join(split_dir, f"fold_{fold}")
+
+    def read_ids(path):
+        with open(path, "r") as f:
+            return [line.strip() for line in f if line.strip()]
+
+    train_ids = read_ids(os.path.join(fold_dir, "train.txt"))
+    val_ids   = read_ids(os.path.join(fold_dir, "val.txt"))
+
+    train_samples = [CustomSample(root_dir, sid) for sid in train_ids]
+    val_samples   = [CustomSample(root_dir, sid) for sid in val_ids]
+
+    return train_samples, val_samples
