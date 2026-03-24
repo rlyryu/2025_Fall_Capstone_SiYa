@@ -494,10 +494,10 @@ def main():
 
         tag = "_".join(parts) if parts else "none"
         
-        exp_dir = os.path.join("training_outputs", f"{tag}_{CONFIG['fusion_option']}")
+        exp_dir = os.path.join("training_outputs", f"{tag}_{CONFIG['fusion_option']}", f"fold_{fold}")
         os.makedirs(exp_dir, exist_ok=True) 
         
-        embedding_root = os.path.join(exp_dir, f"fold_{fold}", "embeddings", "val")    # val set embedding만 저장 -> training_outputs/img_st_concat/embeddings/val
+        embedding_root = os.path.join(exp_dir,"embeddings", "val")    # val set embedding만 저장 -> training_outputs/img_st_concat/embeddings/val
         spot_dir = os.path.join(embedding_root, "spot") # spot embedding 
         wsi_dir = os.path.join(embedding_root, "wsi")   # wsi embedding
 
