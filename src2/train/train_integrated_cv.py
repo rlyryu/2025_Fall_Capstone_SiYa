@@ -226,7 +226,7 @@ def train_epoch(model, loader, criterion, optimizer, scaler, config, device, use
         
             # forward -> bulk/non bulk 분기 ===========================
             if config["is_bulk"]:
-                logits, _, wsi_embed = forward_bulk_early_fusion_chunkwise(
+                logits, _, wsi_embed, spot_embeds = forward_bulk_early_fusion_chunkwise(
                     model, batch, config, device
                 )
             else:
@@ -581,6 +581,7 @@ def main():
             "val_auc": best_val_auc,
             "val_f1": best_val_f1
         })
+        # end of epoch
 
     print("\nTRAINING COMPLETE!!")
 
@@ -592,6 +593,7 @@ def main():
     print(f"Acc: {mean_acc:.2f}")
     print(f"AUC: {mean_auc:.4f}")
     print(f"F1: {mean_f1:.4f}")
+    # end of fold
 
 
 if __name__ == "__main__":
