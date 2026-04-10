@@ -286,6 +286,8 @@ class SpatialAttention(nn.Module):
             nn.Dropout(dropout),
         )
 
+        self.tau = 2.0  # temperature for attention scaling
+
         self.attn_dropout = nn.Dropout(dropout)
     
     def _build_knn_mask(self, coords):
@@ -336,6 +338,8 @@ class SpatialAttention(nn.Module):
 
         # scaled dot-product attention
         attn_scores = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5)  # (H, N, N)    
+        attn_scores = attn_scores / self.tau
+        
         knn_mask = self._build_knn_mask(coords)  # (N, N)
         attn_scores = attn_scores.masked_fill(~knn_mask.unsqueeze(0), float('-inf'))
         
