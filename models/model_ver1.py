@@ -315,6 +315,7 @@ class SpatialAttention(nn.Module):
         )
 
         self.tau = 2.0  # temperature for attention scaling
+        self.alpha = 0.3  # residual scaling factor
 
         self.attn_dropout = nn.Dropout(dropout)
     
@@ -381,8 +382,8 @@ class SpatialAttention(nn.Module):
         out = out.transpose(0, 1).contiguous().view(N, D)  # (N, D)
         out = self.out_proj(out)
 
-        # residual
-        x = spot_embeds + out
+        # residual(scaled)
+        x = spot_embeds + self.alpha * out
 
         # FFN
         x = x + self.ffn(self.norm2(x))
