@@ -148,6 +148,8 @@ class SpatialSTEncoder(nn.Module):
         pooled = torch.matmul(attn, v).squeeze(1)
         pooled = self.out_proj(pooled)
 
+        gene_indices = None
+
         if return_gene_attn:
             gene_attn = attn.squeeze(1)
             return pooled, gene_attn, gene_indices
