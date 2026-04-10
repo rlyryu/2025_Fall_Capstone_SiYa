@@ -301,8 +301,11 @@ class SpatialAttention(nn.Module):
         N = coords.size(0)
         device = coords.device
 
-        # pairwise distance
+        # pairwise distance (higher if closer)
         dist = torch.cdist(coords, coords, p=2)  # (N, N)
+        dist = dist / (dist.max() + 1e-6)  # normalize to [0, 1]
+        dist_bias = -dist
+        attn_scores = attn_scores + dist_bias.unsqueeze(0)
 
         # Find kNN excluding self
         if self.include_self:
@@ -339,7 +342,7 @@ class SpatialAttention(nn.Module):
         # scaled dot-product attention
         attn_scores = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5)  # (H, N, N)    
         attn_scores = attn_scores / self.tau
-        
+
         knn_mask = self._build_knn_mask(coords)  # (N, N)
         attn_scores = attn_scores.masked_fill(~knn_mask.unsqueeze(0), float('-inf'))
         
