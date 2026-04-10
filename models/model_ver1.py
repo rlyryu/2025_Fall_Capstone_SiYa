@@ -287,7 +287,7 @@ class SpatialAttention(nn.Module):
         num_heads=4,
         k=8,    # neighbors
         dropout=0.1,
-        include_self=True
+        include_self=False
     ):
         super().__init__()
         assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
@@ -505,7 +505,7 @@ class MultiModalMILModel(nn.Module):
                 num_heads=spatial_attn_heads,
                 k=spatial_attn_k,
                 dropout=spatial_attn_dropout,
-                include_self=True,
+                include_self=False,
             )
         else:
             self.spatial_attn = None
